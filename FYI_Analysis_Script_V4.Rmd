@@ -1,0 +1,1683 @@
+---
+title: 'FYI Final Analysis, Predicting ASD: No Missing Dataset, Repeated CV'
+author: "Kevin Donovan"
+output:
+  html_document: default
+always_allow_html: yes
+
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning = FALSE)
+```
+
+```{r set-up, include=F, message=F, warning=F}
+library(tableone)
+library(labelled)
+library(lsr)
+library(readxl)
+library(tidyverse)
+library(randomForest)
+library(DMwR)
+library(pROC)
+library(Epi)
+library(kableExtra)
+library(expss)
+library(qwraps2)
+library(caret)
+library(lsmeans)
+library(rcompanion)
+
+set.seed(012)
+```
+
+# Intro
+The goal of this analysis is to predict autism diagnosis (ASD) done at Month 24 (denoted "diagnosis group") using the child's responses to the FYI questionnaire taken at Month 12.  This was done in  "A Parent-Report Instrument for Identifying One-Year-Olds at Risk for an Eventual Diagnosis of Autism: The First Year Inventory" by Reznick et al. (2007).  In this analysis, prediction using the actual multiple choice answers to the questions will be used.  The sample used in this analysis is a high risk (HR) population, defined by having an older sibling with diagnoses ASD.  ASD Positive vs Negative prediction will be done, as will Atypical vs Typical prediction.  Typicallity was determined by ... .  This analysis is done on those with no FYI questions missing and between 11.5 and 13 years of age inclusive ("No Missing").
+
+Due to the large number of predictors being considered here (60 questions) and the propensity for CART to overfit the training data, Random Forest will be used for this analysis with the 60 questions.  Random Forest also has a measure of predictor "importance", i.e. measuring how much a predictor impacts the predictor algorithm generaetd from the data, which will be used here due to the large number of predictors.
+ 
+Even in the HR sample, there is a large imbalance in the ASD positive and negative counts.  This will cause the Random Forest algorithm to classify many ASDs as Typical; this class imbalance will be addressed later in the report.  The structure of this report is as follows
+
+1. Demographic Summary Statistics
+2. Testing of FYI Score Difference Among Diagnosis Groups
+3. Prediction of ASD Positive vs ASD Negative in HR sample
+a) in full dataset with all 60 items
+b) in full dataset with subsets of items (FYI Lite)
+4. Prediction of Atypical and Typical in HR sample
+a) in full dataset with all 60 items
+
+Note that in this report, **5 fold cross validation was used, repeated 50 times, with folds striaified by diagnosis** was used.
+
+```{r data, eval=T}
+## Load dataset
+dataset_v1 <- read_excel("../Data/SSM_FYI_Demog_merged_Final_15_Dec_Updated_Aug2019.xlsx", 
+                         na = c("", ".", "BLANK","N0_RL_V12","No_EL","No_Mullen","Partial_Mullen","No_FM"))
+
+dataset_v2_all <- dataset_v1 %>% select(Identifiers, Groups, Gender, Site, Risk, 
+                                    `FYI Age`,
+                                    Father_Educ_Final_Cat,Father_Race_coded,
+                                    Mother_educ_final_cat,Mother_Race_coded,
+                                    Child_Race_Coded, `Change vs Stable`,
+                                    `V12 mullen_composite_standard_score`,
+                                    `V24 mullen_composite_standard_score`,
+                                    `V12 mullen_receptive_language_t`,
+                                    `V24 mullen_receptive_language_t`,
+                                    `V12 mullen_expressive_language_t`,
+                                    `V24 mullen_expressive_language_t`,
+                                    `V12 mullen_visual_reception_t`,
+                                    `V24 mullen_visual_reception_t`,
+                                    `V12 mullen_fine_motor_t`,
+                                    `V24 mullen_fine_motor_t`,
+                                    `V12 aosi_total_score_1_18`,
+                                    `V24 ADOS_Derived_ADOS_RRB_CSS`,
+                                    `V24 ADOS_Derived_ADOS_SA_CSS`,
+                                    `V24 ADOS_Derived_severity_score_lookup`,
+                                    `V12 mullen_Candidate_Age`,
+                                    `V24 mullen_Candidate_Age`,
+                                    FYIq_1:FYIq_60, `MISSING SUM`,
+                                    `V12 fyi_person_filling_out`,
+                                    `V12 fyi_soc_com_risk`, 
+                                    `V12 fyi_sen_reg_risk`, 
+                                    `V12 fyi_risk_score`,
+                                    `V12 fyi_orientrec`:`V12 fyi_repplay`, 
+                                    `V12 fyi_senproc`) %>%
+  rename("Change"="Change vs Stable",
+         "V12.Child.Age"="V12 mullen_Candidate_Age",
+         "V24.Child.Age"="V24 mullen_Candidate_Age") %>%
+  mutate(Child_Race_Final=ifelse(Child_Race_Coded=="White", "White",
+                                 ifelse(is.na(Child_Race_Coded)==1, NA, "Other")),
+         Father_Race_Final=ifelse(Father_Race_coded=="White", "White",
+                                 ifelse(is.na(Father_Race_coded)==1, NA, "Other")),
+         Mother_Race_Final=ifelse(Mother_Race_coded=="White", "White",
+                                 ifelse(is.na(Mother_Race_coded)==1, NA, "Other")),
+         `V12 fyi_person_filling_out`=ifelse(`V12 fyi_person_filling_out`=="not_answered"|`V12 fyi_person_filling_out`=="other",NA,`V12 fyi_person_filling_out`)) %>%
+  mutate(Missing_Group=ifelse(`MISSING SUM`>0, 1, 0))
+
+# Convert to factor variables
+dataset_v2_all <- as_tibble(data.frame(lapply(dataset_v2_all, factor)))
+# Re-convert risk scores, age, and other cognitive measures to numeric
+num_vars <- names(dataset_v2_all)[grepl("V12|V24", names(dataset_v2_all))]
+num_vars <- num_vars[num_vars!="V12.fyi_person_filling_out"]
+
+dataset_v2_all <- data.frame(dataset_v2_all)
+for(i in 1:length(num_vars)){
+  j <- which(names(dataset_v2_all)==num_vars[i])
+  dataset_v2_all[,j]=as.numeric(as.character(dataset_v2_all[,j]))
+}
+
+dataset_v2_all <- as_tibble(dataset_v2_all) %>% 
+  mutate(MISSING.SUM=as.numeric(as.character(MISSING.SUM)),
+         FYI.Age=as.numeric(as.character(FYI.Age)),
+         Groups=relevel(Groups, ref="HR_typ"),
+         Child_Race_Coded=plyr::revalue(Child_Race_Coded,
+                                      c("African_American"="Black",
+                                     "asian"="Asian",
+                                     "more_than_one_race"="More_than_one_race",
+                                     "white"="White")),
+         Father_Educ_Final_Cat=relevel(Father_Educ_Final_Cat, ref="Coll"),
+         Mother_educ_final_cat=relevel(Mother_educ_final_cat, ref="Coll"))
+
+# This will be used for prediction and all main analyses; dataset with missing only used to analyze differences in responders vs non-responders
+dataset_v2 <- dataset_v2_all %>%
+  filter(MISSING.SUM==0)
+
+# Create HR dataset
+dataset_HR <- dataset_v2 %>% filter(Risk == "HR") %>% mutate(Groups_2=factor(ifelse(Groups=="HR_ASD","HR_ASD","HR_Neg")),
+       Groups_3=factor(ifelse(Groups=="HR_ASD"|Groups=="HR_Atyp","HR_Atyp","HR_typ")))
+
+# Change reference level of Groups_2, Groups_3
+dataset_HR$Groups_2 <- relevel(dataset_HR$Groups_2, ref="HR_Neg")
+dataset_HR$Groups_3 <- relevel(dataset_HR$Groups_3, ref="HR_typ")
+
+# Create datset for ASD vs Atyp
+dataset_HR_ASD_Atyp <- dataset_HR %>% 
+  filter(Groups=="HR_ASD"|Groups=="HR_Atyp")
+```
+
+## Demographic Statistics
+First, we show summary statistics of various demographic variables for this sample.  Note that here, we consider the following diagnosis groupings: 1) HR-ASD, 2) HR-Neg (ASD Negative), and 3) LR-Neg.
+
+```{r summ_stats, results='asis', eval=T}
+# Quickly see which variables have missing values
+# dataset_v2 %>% select(FYI.Age,Child_Race_Final,Gender,Groups,Father_Educ_Final_Cat,Father_Race_Final,
+#                       Mother_educ_final_cat, Mother_Race_Final,Site)
+#  summary()
+
+## Create summary table objects
+# Summary stats
+dataset_sum <- dataset_v2 %>% 
+  mutate(Groups=plyr::revalue(Groups,c("LR"="Low Risk",
+                                       "LR_Atyp"="Low Risk",
+                                       "LRASD"="Low Risk",
+                                       "HR_Neg"="High Risk: Typical",
+                        "HR_typ"="High Risk: Typical",
+                        "HR_ASD"="High Risk: ASD",
+                        "HR_Atyp"="High Risk: Atypical")) %>%
+           fct_relevel("High Risk: ASD", "High Risk: Atypical", 
+                       "High Risk: Typical", "Low Risk"),
+         Groups_NoAtyp=plyr::revalue(Groups,c("High Risk: Typical"="High Risk: No ASD",
+                        "High Risk: Atypical"="High Risk: No ASD")) %>%
+           fct_relevel("High Risk: ASD", "High Risk: No ASD", "Low Risk"))
+
+summary_list <- 
+  list("Age at completion of FYI" =
+         list("Mean (SD)"=~qwraps2::mean_sd(FYI.Age, na_rm = TRUE, digits=1)),
+        "Age at Month 12 Clinic Visit" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.Child.Age,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month MSEL ELC (standard score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.mullen_composite_standard_score,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month MSEL Expressive Language (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.mullen_expressive_language_t,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month MSEL Fine Motor (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.mullen_fine_motor_t,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month MSEL Receptive Language (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.mullen_receptive_language_t,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month MSEL Visual Reception (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.mullen_visual_reception_t,
+                                            na_rm = TRUE, digits=1)),
+       "12 Month AOSI Total Score" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V12.aosi_total_score_1_18,
+                                            na_rm = TRUE, digits=1)),
+       "Age at Month 24 Clinic Visit" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.Child.Age,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month MSEL ELC (standard score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.mullen_composite_standard_score,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month MSEL Expressive Language (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.mullen_expressive_language_t,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month MSEL Fine Motor (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.mullen_fine_motor_t,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month MSEL Receptive Language (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.mullen_receptive_language_t,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month MSEL Visual Reception (t score)" =
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.mullen_visual_reception_t,
+                                            na_rm = TRUE, digits=1)),
+       "24 Month ADOS Severity Score"=
+         list("Mean (SD)"=~qwraps2::mean_sd(V24.ADOS_Derived_severity_score_lookup,
+                                 na_rm = TRUE, digits=1)),
+       "Primary Respondent of FYI"=
+         list("Father"=~qwraps2::n_perc(V12.fyi_person_filling_out=="father",
+                                        na_rm = TRUE, digits=1,
+                                        show_denom = "never"),
+              "Mother"=~qwraps2::n_perc(V12.fyi_person_filling_out=="mother",
+                                        na_rm = TRUE, digits=1,
+                                        show_denom = "never"),
+              "Both"=~qwraps2::n_perc(V12.fyi_person_filling_out=="both",
+                                      na_rm = TRUE, digits=1,
+                                      show_denom = "never")),
+       "Child Gender" =
+         list("Female"=~qwraps2::n_perc(Gender=="Female", 
+                                        na_rm = TRUE, digits=1,
+                                        show_denom = "never"),
+              "Male"=~qwraps2::n_perc(Gender=="Male", na_rm = TRUE, 
+                                      digits=1,
+                                      show_denom = "never")),
+       "Child Race" =
+         list("Asian"=~qwraps2::n_perc(Child_Race_Coded=="Asian",
+                                       na_rm = TRUE, digits=1,
+                                       show_denom = "never"),
+              "Black"=~qwraps2::n_perc(Child_Race_Coded=="Black",
+                                       na_rm = TRUE, digits=1,
+                                       show_denom = "never"),
+              "Other"=~qwraps2::n_perc(Child_Race_Coded=="More_than_one_race",
+                                       na_rm = TRUE, digits=1,
+                                       show_denom = "never"),
+              "White"=~qwraps2::n_perc(Child_Race_Coded=="White",
+                                       na_rm = TRUE, digits=1,
+                                       show_denom = "never"),
+              "Missing"=~qwraps2::n_perc(is.na(Child_Race_Coded)==1, 
+                                         digits=1, show_denom = "never")),
+       "Father's Highest Level of Education" =
+         list("High School Graduate"=~qwraps2::n_perc(Father_Educ_Final_Cat=="HS",
+                                                      na_rm = TRUE, 
+                                                      digits=1,
+                                                      show_denom = "never"),
+              "Some College"=~qwraps2::n_perc(Father_Educ_Final_Cat=="Coll", 
+                                              na_rm = TRUE,digits=1, 
+                                              show_denom = "never"),
+              "College Graduate"=~qwraps2::n_perc(Father_Educ_Final_Cat=="Grad", 
+                                                   na_rm = TRUE, digits=1,
+                                                  show_denom = "never"),
+              "Missing"=~qwraps2::n_perc(is.na(Father_Educ_Final_Cat)==1, 
+                                         digits=1, show_denom = "never")),
+       "Mother's Highest Level of Education" =
+         list("High School Graduate"=~qwraps2::n_perc(Mother_educ_final_cat=="HS", 
+                                                       na_rm = TRUE, digits=1,
+                                                      show_denom = "never"),
+              "Some College"=~qwraps2::n_perc(Mother_educ_final_cat=="Coll", 
+                                              na_rm = TRUE,
+                                              digits=1, show_denom = "never"),
+              "College Graduate"=~qwraps2::n_perc(Mother_educ_final_cat=="Grad", 
+                                                   na_rm = TRUE, digits=1,
+                                                  show_denom = "never"),
+              "Missing"=~qwraps2::n_perc(is.na(Mother_educ_final_cat)==1,
+                                         digits=1,show_denom = "never")),
+       "Recruitment Site" =
+         list("Chapel Hill"=~qwraps2::n_perc(Site=="UNC", digits=1),
+              "Philadelphia"=~qwraps2::n_perc(Site=="PHI", digits=1),
+              "Seattle"=~qwraps2::n_perc(Site=="SEA", digits=1),
+              "St. Louis"=~qwraps2::n_perc(Site=="STL", digits=1))
+       )
+
+# Create list of p-values for group comparisons for each variable in summary table
+fit_summ_cont <- list(
+  "Age at FYI"=lm(FYI.Age~Groups_NoAtyp, data=dataset_sum),
+  "Age at 12 months"=lm(V12.Child.Age~Groups_NoAtyp, data=dataset_sum),
+  "12 Month MSEL Composite"=lm(V12.mullen_composite_standard_score~Groups_NoAtyp, 
+                               data = dataset_sum),
+  "12 Month MSEL Expressive Language (t score)"=lm(V12.mullen_expressive_language_t~Groups_NoAtyp,
+                                            data = dataset_sum),
+  "12 Month MSEL Fine Motor"=lm(V12.mullen_fine_motor_t~Groups_NoAtyp,
+                                data = dataset_sum),
+  "12 Month MSEL Receptive Language (t score)"=lm(V12.mullen_receptive_language_t~Groups_NoAtyp, data = dataset_sum),
+  "12 Month MSEL Visual Reception (t score)"=lm(V12.mullen_visual_reception_t~Groups_NoAtyp,
+                                                data = dataset_sum),
+  "12 Month AOSI Total Score"=lm(V12.aosi_total_score_1_18~Groups_NoAtyp,
+                                 data = dataset_sum),
+  "Age at 24 months"=lm(V24.Child.Age~Groups_NoAtyp,
+                       data = dataset_sum),
+  "24 Month MSEL Composite"=lm(V24.mullen_composite_standard_score~Groups_NoAtyp, 
+                               data = dataset_sum),
+  "24 Month MSEL Expressive Language" =lm(V24.mullen_expressive_language_t~Groups_NoAtyp,
+                                            data = dataset_sum),
+  "24 Month MSEL Fine Motor"=lm(V24.mullen_fine_motor_t~Groups_NoAtyp,
+                                data = dataset_sum),
+  "24 Month MSEL Receptive Language (t score)"=lm(V24.mullen_receptive_language_t~Groups_NoAtyp, data = dataset_sum),
+  "24 Month MSEL Visual Reception (t score)"=lm(V24.mullen_visual_reception_t~Groups_NoAtyp,
+                                                data = dataset_sum),
+  "24 Month ADOS Severity Score"=lm(V24.ADOS_Derived_severity_score_lookup~Groups_NoAtyp,
+                            data = dataset_sum))
+
+fit_summ_discrete <- list(
+  "Primary Respondent of FYI"=summary(xtabs(~V12.fyi_person_filling_out+Groups_NoAtyp,
+                                            data=dataset_sum)),
+  "Gender"=summary(xtabs(~Gender+Groups_NoAtyp,data=dataset_sum)),
+  "Race"=fisher.test(xtabs(~Child_Race_Coded+Groups_NoAtyp,
+                       data=dataset_sum)),
+  "Father's Educ"=summary(xtabs(~Father_Educ_Final_Cat+Groups_NoAtyp,
+                       data=dataset_sum)),
+  "Mother's Educ"=summary(xtabs(~Mother_educ_final_cat+Groups_NoAtyp,
+                       data=dataset_sum)),
+  "Site"=summary(xtabs(~Site+Groups_NoAtyp,
+                       data=dataset_sum))
+  )
+
+extract_p <- function(x, y){
+  if(y=="continuous"){
+    p_val <- summary(aov(x))[[1]][1,"Pr(>F)"]
+    ifelse(p_val<0.001, "<0.001", round(p_val, 3))
+  }else{
+    p_val <- x$p.value
+    ifelse(p_val<0.001, "<0.001", round(p_val, 3))
+  }
+}
+
+extract_test_stat <- function(x, y){
+  if(y=="continuous"){
+    test_stat <- summary(aov(x))[[1]][1,"F value"]
+    round(test_stat, 2)
+  }else{
+    test_stat <- x$statistic
+    switch(is.null(test_stat)+1, round(test_stat, 2), NA)
+  }
+}
+
+extract_df <- function(x, y){
+  if(y=="continuous"){
+    paste(summary(aov(fit_summ_cont[[1]]))[[1]][,"Df"], collapse = ", ")
+  }else{
+    test_stat <- x$parameter
+    switch(is.null(test_stat)+1, round(test_stat, 2), NA)
+  }
+}
+
+pvals_summ_continuous <- lapply(X=fit_summ_cont, FUN=extract_p, y="continuous")
+pvals_summ_discrete <- lapply(X=fit_summ_discrete, FUN=extract_p, y="discrete")
+pvals_all <- c(unlist(pvals_summ_continuous, use.names = F), 
+               unlist(pvals_summ_discrete, use.names = F))
+pvals_all_names <- c(names(pvals_summ_continuous), names(pvals_summ_discrete))
+
+
+teststat_summ_continuous <- lapply(X=fit_summ_cont, FUN=extract_test_stat,
+                                   y="continuous")
+teststat_summ_discrete <- lapply(X=fit_summ_discrete, FUN=extract_test_stat, 
+                                 y="discrete")
+teststat_all <- c(unlist(teststat_summ_continuous, use.names = F), 
+               unlist(teststat_summ_discrete, use.names = F))
+teststat_all_names <- c(names(teststat_summ_continuous), 
+                        names(teststat_summ_discrete))
+
+df_summ_continuous <- lapply(X=fit_summ_cont, FUN=extract_df,
+                                   y="continuous")
+df_summ_discrete <- lapply(X=fit_summ_discrete, FUN=extract_df, 
+                                 y="discrete")
+df_all <- c(unlist(df_summ_continuous, use.names = F), 
+               unlist(df_summ_discrete, use.names = F))
+df_all_names <- c(names(df_summ_continuous), 
+                        names(df_summ_discrete))
+
+
+# Extract pairwise comparisons
+
+pairwise_summ_cont <- list(
+  "Age at FYI Completion"=pairwise.t.test(dataset_sum$FYI.Age,dataset_sum$Groups_NoAtyp),
+  "Age at 12 months"=pairwise.t.test(dataset_sum$V12.Child.Age,dataset_sum$Groups_NoAtyp),
+  "12 Month MSEL Composite"=pairwise.t.test(dataset_sum$V12.mullen_composite_standard_score,dataset_sum$Groups_NoAtyp),
+  "12 Month MSEL Expressive Language (t score)"=pairwise.t.test(dataset_sum$V12.mullen_expressive_language_t,dataset_sum$Groups_NoAtyp),
+  "12 Month MSEL Fine Motor"=pairwise.t.test(dataset_sum$V12.mullen_fine_motor_t,dataset_sum$Groups_NoAtyp),
+  "12 Month MSEL Receptive Language (t score)"=pairwise.t.test(dataset_sum$V12.mullen_receptive_language_t,dataset_sum$Groups_NoAtyp),
+  "12 Month MSEL Visual Reception (t score)"=pairwise.t.test(dataset_sum$V12.mullen_visual_reception_t,dataset_sum$Groups_NoAtyp),
+  "12 Month AOSI Total Score"=pairwise.t.test(dataset_sum$V12.aosi_total_score_1_18,dataset_sum$Groups_NoAtyp),
+  "Age at 24 months"=pairwise.t.test(dataset_sum$V24.Child.Age,dataset_sum$Groups_NoAtyp),
+  "24 Month MSEL Composite"=pairwise.t.test(dataset_sum$V24.mullen_composite_standard_score,dataset_sum$Groups_NoAtyp),
+  "24 Month MSEL Expressive Language"=pairwise.t.test(dataset_sum$V24.mullen_expressive_language_t,dataset_sum$Groups_NoAtyp),
+  "24 Month MSEL Fine Motor"=pairwise.t.test(dataset_sum$V24.mullen_fine_motor_t,dataset_sum$Groups_NoAtyp),
+  "24 Month MSEL Receptive Language (t score)"=pairwise.t.test(dataset_sum$V24.mullen_receptive_language_t,dataset_sum$Groups_NoAtyp),
+  "24 Month MSEL Visual Reception (t score)"=pairwise.t.test(dataset_sum$V24.mullen_visual_reception_t,dataset_sum$Groups_NoAtyp),
+  "24 Month ADOS Severity Score"=pairwise.t.test(dataset_sum$V24.ADOS_Derived_severity_score_lookup,dataset_sum$Groups_NoAtyp))
+
+pairwise_summ_discrete <- list(
+    "Primary Respondent of FYI"=pairwiseNominalIndependence(
+    as.table(xtabs(~V12.fyi_person_filling_out+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher=FALSE,
+                                            gtest = FALSE,
+                                            chisq = TRUE,
+                                            method="holm")$p.adj.Chisq,
+  "Gender"=pairwiseNominalIndependence(
+    as.table(xtabs(~Gender+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher=FALSE,
+                                            gtest = FALSE,
+                                            chisq = TRUE,
+                                            method="holm")$p.adj.Chisq,
+  "Race"=pairwiseNominalIndependence(
+    as.table(xtabs(~Child_Race_Coded+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher= TRUE,
+                                            gtest = FALSE,
+                                            chisq = FALSE,
+                                            method="holm")$p.adj.Fisher,
+  "Father's Educ"=pairwiseNominalIndependence(
+    as.table(xtabs(~Father_Educ_Final_Cat+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher=FALSE,
+                                            gtest = FALSE,
+                                            chisq = TRUE,
+                                            method="holm")$p.adj.Chisq,
+  "Mother's Educ"=pairwiseNominalIndependence(
+    as.table(xtabs(~Mother_educ_final_cat+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher=FALSE,
+                                            gtest = FALSE,
+                                            chisq = TRUE,
+                                            method="holm")$p.adj.Chisq,
+  "Site"=pairwiseNominalIndependence(
+    as.table(xtabs(~Site+Groups_NoAtyp,
+                                            data=dataset_sum)),
+                                            compare="column",
+                                            fisher=FALSE,
+                                            gtest = FALSE,
+                                            chisq = TRUE,
+                                            method="holm")$p.adj.Chisq
+  )
+
+convert_continuous <- function(x){
+as.vector(x$p.value)[complete.cases(as.vector(x$p.value))]
+}
+
+pairwise_summ_cont_convert <- lapply(pairwise_summ_cont, convert_continuous)
+pairwise_summ_cont_convert_matrix <- do.call("rbind", pairwise_summ_cont_convert)
+
+pairwise_summ_discrete_convert <- t(do.call("cbind", pairwise_summ_discrete))
+
+pairwise_summ_all <- rbind(pairwise_summ_cont_convert_matrix, 
+                           pairwise_summ_discrete_convert)
+pairwise_summ_all_v2 <- matrix(as.numeric(pairwise_summ_all), nrow=nrow(pairwise_summ_all))
+
+# Both should be the same
+#pairwise_summ_discrete_convert["Comparisons",]
+#pairwise_summ_discrete_convert[1,]
+rownames(pairwise_summ_all_v2) <- rownames(pairwise_summ_all)
+
+p_value_convert <- function(x){
+  ifelse(x<0.001, "<0.001", round(x,3))
+}
+pairwise_summ_all_v3 <- apply(pairwise_summ_all_v2, c(1,2), p_value_convert)
+
+# Create table: Version 1
+summ_table <- summary_table(dplyr::group_by(dataset_sum, Groups_NoAtyp), 
+                                     summary_list)
+  
+summ_table_v3 <- cbind(summ_table, 
+                       "P-value"="",
+                       "Test Statistic"="",
+                       "Df"="",
+                       "High Risk: ASD vs High Risk: No ASD"="",
+                       "High Risk: ASD vs Low Risk"="",
+                       "High Risk: No ASD vs Low Risk"="")
+summ_table_v3[c(1:15, 16, 19, 21, 26, 30, 34), 
+              "P-value"] <- pvals_all
+summ_table_v3[c(1:15, 16, 19, 21, 26, 30, 34), 
+              "Test Statistic"] <- teststat_all
+summ_table_v3[c(1:15, 16, 19, 21, 26, 30, 34), 
+              "Df"] <- df_all
+summ_table_v3[c(1:15, 16, 19, 21, 26, 30, 34), 
+              c(7:9)] <- pairwise_summ_all_v3
+colnames(summ_table_v3) <- gsub("Groups: ","",colnames(summ_table_v3))
+
+# Now create table for multiple comps
+print(summ_table_v3, markup="markdown")
+```
+
+### Compare Full Responders to Partial Responders
+```{r summ_stats_nomiss_vs_miss, results='asis', eval=T}
+# Quickly see which variables have missing values
+# dataset_v2 %>% select(FYI.Age,Child_Race_Final,Gender,Groups,Father_Educ_Final_Cat,Father_Race_Final,
+#                       Mother_educ_final_cat, Mother_Race_Final,Site)
+#  summary()
+
+## Create summary table objects
+# Summary stats
+dataset_sum_all_v0 <- dataset_v2_all %>% 
+  mutate(Missing_Group=plyr::revalue(Missing_Group,c("0"="No Missing",
+                        "1"="Some Missing")) %>%
+           fct_relevel("Some Missing", "No Missing"),
+         Child_Race_Coded=plyr::revalue(Child_Race_Coded, c("African_American"="Black",
+                                                            "hispanic"="Hispanic",
+                                                            "More_than_one_race"="Other",
+                                                            "non_hispanic"="White")) %>%
+           fct_relevel("Black","Hispanic","Other","White"),
+         Group_NoRisk=plyr::revalue(Groups,c("HR_typ"="Neg",
+                        "HR_ASD"="ASD",
+                        "HR_Atyp"="Neg",
+                        "HR_Neg"="Neg",
+                        "LR"="Neg",
+                        "LR_Atyp"="Neg",
+                        "LRASD"="ASD")) %>%
+           fct_relevel("ASD", "Neg"),
+         Groups_NoAtyp=plyr::revalue(Groups,c("HR_typ"="High Risk: No ASD",
+                                              "HR_Atyp"="High Risk: No ASD",
+                                              "HR_ASD"="High Risk: ASD",
+                                              "HR_Neg"="High Risk: No ASD",
+                                              "LR"="Low Risk",
+                        "LR_Atyp"="Low Risk",
+                        "LRASD"="Low Risk")) %>%
+           fct_relevel("High Risk: ASD", "High Risk: No ASD", "Low Risk"),
+         Father_Educ_Final_Cat=plyr::revalue(Father_Educ_Final_Cat,c("Coll"="Some College",
+                                                                     "Grad"="College Graduate",
+                                                                     "HS"="High School Graduate"))%>%
+           fct_relevel("High School Graduate", "Some College"),
+         Mother_educ_final_cat=plyr::revalue(Mother_educ_final_cat,c("Coll"="Some College",
+                                                                     "Grad"="College Graduate",
+                                                                     "HS"="High School Graduate"))%>%
+           fct_relevel("High School Graduate", "Some College"),
+         Site=plyr::revalue(Site,c("UNC"="Chapel Hill",
+                                   "PHI"="Philadelphia",
+                                   "SEA"="Seattle",
+                                   "STL"="St. Louis"))%>%
+           fct_relevel("Chapel Hill"),
+        V12.fyi_person_filling_out=plyr::revalue(V12.fyi_person_filling_out,c("both"="Both",
+                                                                              "father"="Father",
+                                                                              "mother"="Mother"))%>%
+          fct_relevel("Father", "Mother"))
+
+for(i in 1:length(levels(dataset_sum_all_v0$Groups_NoAtyp))){
+  dataset_sum_all <- dataset_sum_all_v0 %>% 
+    filter(Groups_NoAtyp==levels(dataset_sum_all_v0$Groups_NoAtyp)[i])
+  
+var_label(dataset_sum_all) <- list(FYI.Age="Age at completion of FYI", 
+                                   V12.Child.Age="Age at Month 12 Clinic Visit",
+                                   V12.mullen_composite_standard_score="12 Month MSEL ELC (standard score)",
+                                   V12.mullen_expressive_language_t="12 Month MSEL Expressive Language (t score)",
+                                   V12.mullen_fine_motor_t="12 Month MSEL Fine Motor (t score)",
+                                   V12.mullen_receptive_language_t="12 Month MSEL Receptive Language (t score)",
+                                   V12.mullen_visual_reception_t="12 Month MSEL Visual Reception (t score)",
+                                   V12.aosi_total_score_1_18="12 Month AOSI Total Score",
+                                   V24.Child.Age="Age at Month 24 Clinic Visit",
+                                   V24.mullen_composite_standard_score="24 Month MSEL ELC (standard score)",
+                                   V24.mullen_expressive_language_t="24 Month MSEL Expressive Language (t score)",
+                                   V24.mullen_fine_motor_t="24 Month MSEL Fine Motor (t score)",
+                                   V24.mullen_receptive_language_t="24 Month MSEL Receptive Language (t score)",
+                                   V24.mullen_visual_reception_t="24 Month MSEL Visual Reception (t score)",
+                                   V24.ADOS_Derived_severity_score_lookup="24 Month ADOS Severity Score",
+                                   V12.fyi_person_filling_out="Primary Respondent of FYI",
+                                   Gender="Gender",
+                                   Child_Race_Coded="Child Race",
+                                   Father_Educ_Final_Cat="Father's Highest Level of Education",
+                                   Mother_educ_final_cat="Mother's Highest Level of Education",
+                                   Site="Site")
+
+vars_of_interest <- c("FYI.Age", 
+                      "V12.Child.Age", 
+                      sort(names(dataset_sum_all)[grepl("V12.mullen", names(dataset_sum_all))]),
+                      "V12.aosi_total_score_1_18",
+                      "V24.Child.Age",
+                      sort(names(dataset_sum_all)[grepl("V24.mullen", names(dataset_sum_all))]),
+                      "V24.ADOS_Derived_severity_score_lookup",
+                      "V12.fyi_person_filling_out","Gender","Child_Race_Coded",
+                      "Father_Educ_Final_Cat","Mother_educ_final_cat","Site")
+
+table_v0 <- CreateTableOne(vars = vars_of_interest, 
+                           strata = "Missing_Group", data=dataset_sum_all)  
+
+# Now create table
+# write.csv(print(table_v0, catDigits = 1, varLabels = TRUE, exact="Child_Race_Coded"), 
+#           file=paste("Compare_responders_",gsub("[ :]","_",
+#                                                levels(dataset_sum_all_v0$Groups_NoAtyp)[i]),".csv",sep=""))
+}
+```
+
+## Test for FYI Scores Differences in Diagnosis Groups
+Second, we perform ANOVA tests for differences in the mean risk scores between the ASD Positive and ASD Negative-Typical and ASD Negative-Atypical groups.  These tests are done for the 2 domain scores as well as the total risk score (no correction for multiple comparisons is done here).  To do an overall comparison of the three diagnosis groups, an ANOVA test is carried out.  The groups are also compared in pairs by fitting two regression models with domain score as the outcome and diagnosis group as the covariate of interest and "Low Risk" as the reference group.  The first model includes no other covariates.  The second model adds respondant's education as a covariate.  Respondant's education is defined as 1) mother's/father's education if only mother/father reported answering the FYI respectively or 2) as highest education between mother and father if both reported answering the FYI.  **Note that here, we consider the following diagnosis groupings: 1) HR-ASD, 2) HR-Neg (ASD Negative), and 3) LR-Neg.**  
+
+```{r ANOVA_1, eval=T}
+dataset_sum_v2 <- dataset_sum %>% 
+  mutate(Groups=fct_relevel(Groups, "Low Risk", "High Risk: ASD", 
+                            "High Risk: Atypical", 
+                       "High Risk: Typical"),
+         Groups_NoAtyp=fct_relevel(Groups_NoAtyp, "Low Risk", "High Risk: ASD", 
+                            "High Risk: No ASD"),
+         respond_educ=ifelse(V12.fyi_person_filling_out=="mother",
+                                Mother_educ_final_cat,
+                                ifelse(V12.fyi_person_filling_out=="father",
+                                       Father_Educ_Final_Cat,
+                                       pmax(Mother_educ_final_cat, 
+                                           Father_Educ_Final_Cat))) %>%
+           factor() %>% plyr::revalue(c("1"="HS","2"="Coll","3"="Grad")))
+
+## Social Comm
+# Get means and CIs
+soc_com_anova <- lm(V12.fyi_soc_com_risk~Groups_NoAtyp, data=dataset_sum_v2)
+soc_com_for_table <- as.data.frame(lsmeans(soc_com_anova, specs="Groups_NoAtyp"))
+soc_com_for_table <- soc_com_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" "))  %>%
+  select(Groups_NoAtyp, Mean_SE)
+soc_com_for_table <- t(soc_com_for_table)
+colnames(soc_com_for_table) <- soc_com_for_table[1,]
+soc_com_for_table <- soc_com_for_table[-1,]
+soc_com_for_table <- c("Domain"="Social Communication", soc_com_for_table)
+
+## Sensory Reg
+# Get means and CIs
+sens_reg_anova <- lm(V12.fyi_sen_reg_risk~Groups_NoAtyp, data=dataset_sum_v2)
+sens_reg_for_table <- as.data.frame(lsmeans(sens_reg_anova, specs="Groups_NoAtyp"))
+sens_reg_for_table <- sens_reg_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" ")) %>%
+  select(Groups_NoAtyp, Mean_SE)
+sens_reg_for_table <- t(sens_reg_for_table)
+colnames(sens_reg_for_table) <- sens_reg_for_table[1,]
+sens_reg_for_table <- sens_reg_for_table[-1,]
+sens_reg_for_table <- c("Domain"="Sensory Regulation", sens_reg_for_table)
+
+## Total Risk
+# Get means and CIs
+tot_risk_anova <- lm(V12.fyi_risk_score~Groups_NoAtyp, 
+                     data=dataset_sum_v2)
+tot_risk_for_table <- as.data.frame(lsmeans(tot_risk_anova, specs="Groups_NoAtyp"))
+tot_risk_for_table <- tot_risk_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" ")) %>%
+  select(Groups_NoAtyp, Mean_SE)
+tot_risk_for_table <- t(tot_risk_for_table)
+colnames(tot_risk_for_table) <- tot_risk_for_table[1,]
+tot_risk_for_table <- tot_risk_for_table[-1,]
+tot_risk_for_table <- c("Domain"="Total Risk Score", tot_risk_for_table)
+
+## Calculate overall F tests for each domain
+soc_com_f_stat <- paste( round(anova(soc_com_anova)$`F value`[1],2), 
+                         paste("(",anova(soc_com_anova)$Df[1],",",
+                               anova(soc_com_anova)$Df[2],")", sep=""), sep=" ")
+sens_reg_f_stat <- paste( round(anova(sens_reg_anova)$`F value`[1],2), 
+                         paste("(",anova(sens_reg_anova)$Df[1],",",
+                               anova(sens_reg_anova)$Df[2],")", sep=""), sep=" ") 
+total_risk_f_stat <- paste( round(anova(tot_risk_anova)$`F value`[1],2), 
+                         paste("(",anova(tot_risk_anova)$Df[1],",",
+                               anova(tot_risk_anova)$Df[2],")", sep=""), sep=" ") 
+
+soc_com_f_test <- ifelse(anova(soc_com_anova)$`Pr(>F)`[1]>0.001,
+                         round(anova(soc_com_anova)$`Pr(>F)`[1],3),"<0.001") 
+sens_reg_f_test <- ifelse(anova(sens_reg_anova)$`Pr(>F)`[1]>0.001,
+                          round(anova(sens_reg_anova)$`Pr(>F)`[1],3),"<0.001") 
+total_risk_f_test <- ifelse(anova(tot_risk_anova)$`Pr(>F)`[1]>0.001,
+                            round(anova(tot_risk_anova)$`Pr(>F)`[1],1),"<0.001") 
+
+## Combine into single table
+anova_table <- rbind(soc_com_for_table, sens_reg_for_table, tot_risk_for_table)
+anova_table <- cbind(anova_table, 
+                     "F Statistic"=c(soc_com_f_stat, 
+                                     sens_reg_f_stat, total_risk_f_stat),
+                     "P-value"=c(soc_com_f_test, sens_reg_f_test,
+                                 total_risk_f_test))
+
+## Add in multiple comps
+rownames(anova_table) <- NULL
+
+# Create function to calculate Cohen's D
+calc_cohens_d <- function(outcome,group_var,data,order){
+  # Create matrix to house comparisons, in proper order
+  data_group_var <- data %>% select_(group_var) %>% as.matrix() %>% factor()
+  group_levels <- factor(levels(data_group_var)) %>% 
+                    fct_relevel(order)
+  group_levels <- group_levels[order(group_levels)]
+  
+  group_df <- data.frame(A=group_levels, B=group_levels)
+
+  G <- data.frame(expand.grid(group_df))
+  G <- G[,2:1]
+  delete_rows <- which(G$B==G$A)
+  G <- G[-delete_rows,]
+  G <- G[!duplicated(t(apply(G, 1, sort))),]
+  G <- data.frame(lapply(G, as.character), stringsAsFactors = F)
+  G_names <- paste(G$B, G$A, sep=" vs ")
+  
+  Cohen_D_results <- list(NA)
+  
+  # Create Cohen's D for each row in G
+  for(i in 1:dim(G)[1]){
+    l <- paste(group_var, "==", "'" ,G[i,1], "'", "|", 
+                 group_var, "==", "'" ,G[i,2], "'", sep="")
+    
+    data_loop <- data %>% 
+      filter_(l) %>%
+      select_(group_var, outcome) %>%
+      as.data.frame()
+    
+    data_loop[,group_var] <- factor(data_loop[,group_var])
+    
+    cohen_d_frmla <- as.formula(paste(outcome, group_var, sep=" ~ "))
+    Cohen_D_results[[i]] <- round(cohensD(cohen_d_frmla, data=data_loop), 3)
+  }
+  names(Cohen_D_results) <- G_names
+  return(Cohen_D_results)
+}
+order_cohen <- c("Low Risk", "High Risk: ASD", "High Risk: No ASD")
+
+soc_com_pairwise <- pairwise.t.test(dataset_sum_v2$V12.fyi_soc_com_risk,
+                dataset_sum_v2$Groups_NoAtyp)$p.value
+soc_com_pairwise_vector <- ifelse(as.vector(soc_com_pairwise)<0.001,
+                                  "<0.001",
+                                  round(as.vector(soc_com_pairwise),3))
+#
+sens_reg_pairwise <- pairwise.t.test(dataset_sum_v2$V12.fyi_sen_reg_risk,
+                dataset_sum_v2$Groups_NoAtyp)$p.value
+sens_reg_pairwise_vector <- ifelse(as.vector(sens_reg_pairwise)<0.001,
+                                  "<0.001",
+                                  round(as.vector(sens_reg_pairwise),3))
+#
+tot_risk_pairwise <- pairwise.t.test(dataset_sum_v2$V12.fyi_risk_score,
+                dataset_sum_v2$Groups_NoAtyp)$p.value
+tot_risk_pairwise_vector <- ifelse(as.vector(tot_risk_pairwise)<0.001,
+                                  "<0.001",
+                                  round(as.vector(tot_risk_pairwise),3))
+# Add in Cohen's D
+soc_com_cohens_d <- calc_cohens_d(outcome="V12.fyi_soc_com_risk",
+                                   group_var = "Groups_NoAtyp",
+                                   data=dataset_sum_v2,
+                                   order=order_cohen)
+soc_com_cohens_d_vector <- unlist(soc_com_cohens_d)
+#
+sens_reg_cohens_d <- calc_cohens_d(outcome="V12.fyi_sen_reg_risk",
+                                   group_var = "Groups_NoAtyp",
+                                   data=dataset_sum_v2,
+                                   order=order_cohen)
+sens_reg_cohens_d_vector <- unlist(sens_reg_cohens_d)
+#
+tot_risk_cohens_d <- calc_cohens_d(outcome="V12.fyi_risk_score",
+                                   group_var = "Groups_NoAtyp",
+                                   data=dataset_sum_v2,
+                                   order=order_cohen)
+tot_risk_cohens_d_vector <- unlist(tot_risk_cohens_d)
+#
+
+cohens_d_table <- rbind(soc_com_cohens_d_vector, sens_reg_cohens_d_vector,
+                        tot_risk_cohens_d_vector)
+pairwise_anova <- rbind(soc_com_pairwise_vector, sens_reg_pairwise_vector, tot_risk_pairwise_vector)
+
+colnames(pairwise_anova) <- c(paste(colnames(soc_com_pairwise)[1], rownames(soc_com_pairwise), sep=" vs "), paste(colnames(soc_com_pairwise)[2], rownames(soc_com_pairwise), sep=" vs "))
+
+rownames(pairwise_anova) <- NULL
+
+pairwise_anova <- t(t(pairwise_anova)[complete.cases(t(pairwise_anova)),])
+pairwise_anova[] <- paste(pairwise_anova, 
+                          paste("(",cohens_d_table, ")",sep=""), 
+                          sep=" ")
+anova_table_final <- cbind(anova_table, pairwise_anova)
+
+kable(anova_table_final, 
+      col.names = colnames(anova_table_final), 
+      caption="Comparison of group means from regression of domain risk score on diagnosis group.  Estimated group means and their corresponding standard errors (SE), rounded to two decimal spaces, are provided for each domain.  These comparisons were done for Social Communication and Sensory Regulation domains and Total Risk Score.  For each of these, the p-value and test statistic corresponding to the ANOVA F-test for group differences is reported with degrees of freedom for the F statistic in paretheses, along with the p-values for the post-hoc pairwise comparisons.  The Holm adjustment was used for these pairwise comparisons to correct for multiple comparisons.  Cohen's D effect size is also reported in parentheses for each of these comparisons. ") %>% 
+  kable_styling() 
+```
+
+```{r ANOVA_2, eval=T}
+## Social Comm
+# Get means and CIs
+soc_com_anova <- lm(V12.fyi_soc_com_risk~Groups_NoAtyp+respond_educ, data=dataset_sum_v2)
+soc_com_for_table <- as.data.frame(lsmeans(soc_com_anova, specs="Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")))
+soc_com_for_table <- soc_com_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" "))  %>%
+  select(Groups_NoAtyp, Mean_SE)
+soc_com_for_table <- t(soc_com_for_table)
+colnames(soc_com_for_table) <- soc_com_for_table[1,]
+soc_com_for_table <- soc_com_for_table[-1,]
+soc_com_for_table <- c("Domain"="Social Communication", soc_com_for_table)
+
+## Sensory Reg
+# Get means and CIs
+sens_reg_anova <- lm(V12.fyi_sen_reg_risk~Groups_NoAtyp+respond_educ, data=dataset_sum_v2)
+sens_reg_for_table <- as.data.frame(lsmeans(sens_reg_anova, specs="Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")))
+sens_reg_for_table <- sens_reg_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" ")) %>%
+  select(Groups_NoAtyp, Mean_SE)
+sens_reg_for_table <- t(sens_reg_for_table)
+colnames(sens_reg_for_table) <- sens_reg_for_table[1,]
+sens_reg_for_table <- sens_reg_for_table[-1,]
+sens_reg_for_table <- c("Domain"="Sensory Regulation", sens_reg_for_table)
+
+## Total Risk
+# Get means and CIs
+tot_risk_anova <- lm(V12.fyi_risk_score~Groups_NoAtyp+respond_educ, 
+                     data=dataset_sum_v2)
+tot_risk_for_table <- as.data.frame(lsmeans(tot_risk_anova, specs="Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")))
+tot_risk_for_table <- tot_risk_for_table %>%
+  mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" ")) %>%
+  select(Groups_NoAtyp, Mean_SE)
+tot_risk_for_table <- t(tot_risk_for_table)
+colnames(tot_risk_for_table) <- tot_risk_for_table[1,]
+tot_risk_for_table <- tot_risk_for_table[-1,]
+tot_risk_for_table <- c("Domain"="Total Risk Score", tot_risk_for_table)
+
+## Calculate overall F tests for each domain
+soc_com_f_stat <- paste( round(anova(soc_com_anova)$`F value`[1],2), 
+                         paste("(",anova(soc_com_anova)$Df[1],",",
+                               anova(soc_com_anova)$Df[3],")", sep=""), sep=" ")
+sens_reg_f_stat <- paste( round(anova(sens_reg_anova)$`F value`[1],2), 
+                         paste("(",anova(sens_reg_anova)$Df[1],",",
+                               anova(sens_reg_anova)$Df[3],")", sep=""), sep=" ") 
+total_risk_f_stat <- paste( round(anova(tot_risk_anova)$`F value`[1],2), 
+                         paste("(",anova(tot_risk_anova)$Df[1],",",
+                               anova(tot_risk_anova)$Df[3],")", sep=""), sep=" ") 
+
+soc_com_f_test <- ifelse(anova(soc_com_anova)$`Pr(>F)`[1]>0.001,
+                         round(anova(soc_com_anova)$`Pr(>F)`[1],3),"<0.001") 
+sens_reg_f_test <- ifelse(anova(sens_reg_anova)$`Pr(>F)`[1]>0.001,
+                          round(anova(sens_reg_anova)$`Pr(>F)`[1],3),"<0.001") 
+total_risk_f_test <- ifelse(anova(tot_risk_anova)$`Pr(>F)`[1]>0.001,
+                            round(anova(tot_risk_anova)$`Pr(>F)`[1],1),"<0.001") 
+
+## Combine into single table
+anova_table <- rbind(soc_com_for_table, sens_reg_for_table, tot_risk_for_table)
+anova_table <- cbind(anova_table, 
+                     "F Statistic"=c(soc_com_f_stat, 
+                                     sens_reg_f_stat, total_risk_f_stat),
+                     "P-value"=c(soc_com_f_test, sens_reg_f_test,
+                                 total_risk_f_test))
+
+## Add in multiple comps
+rownames(anova_table) <- NULL
+
+Contrasts = list(Low_Risk_vs_High_Risk__ASD = c(1,  -1,  0),
+                 Low_Risk_vs_High_Risk__No_ASD = c(1,  0,  -1),
+                 High_Risk__ASD_vs_High_Risk__No_ASD = c( 0,  1, -1))
+
+soc_com_pairwise_obj <- contrast(lsmeans(soc_com_anova, "Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")), 
+                                 Contrasts, 
+                                 adjust = "holm")
+soc_com_pairwise <- as.data.frame(summary(soc_com_pairwise_obj))[,c("contrast",                                                               "p.value")]
+soc_com_pairwise_vector <- ifelse(soc_com_pairwise$p.value<0.001, "<0.001",
+                                   round(soc_com_pairwise$p.value, 3))
+
+sens_reg_pairwise_obj <- contrast(lsmeans(sens_reg_anova, "Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")), 
+                                  Contrasts, 
+                                 adjust = "holm")
+sens_reg_pairwise <- as.data.frame(summary(sens_reg_pairwise_obj))[,c("contrast",                                                               "p.value")]
+sens_reg_pairwise_vector <- ifelse(sens_reg_pairwise$p.value<0.001, "<0.001",
+                                   round(sens_reg_pairwise$p.value, 3))
+
+tot_risk_pairwise_obj <- contrast(lsmeans(tot_risk_anova, "Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")), 
+                                  Contrasts, 
+                                 adjust = "holm")
+tot_risk_pairwise <- as.data.frame(summary(tot_risk_pairwise_obj))[,c("contrast",                                                               "p.value")]
+tot_risk_pairwise_vector <- ifelse(tot_risk_pairwise$p.value<0.001, "<0.001",
+                                   round(tot_risk_pairwise$p.value, 3))
+
+pairwise_anova <- rbind(soc_com_pairwise_vector, sens_reg_pairwise_vector, tot_risk_pairwise_vector)
+
+colnames(pairwise_anova) <- gsub("  ", ": ",
+                                 gsub("_"," ",soc_com_pairwise$contrast))
+
+rownames(pairwise_anova) <- NULL
+
+# Calculate Cohen's D using difference in means divided by residual SE
+soc_com_resid_SE <- sqrt(anova(soc_com_anova)$`Mean Sq`[3])
+soc_com_cohens_d_vector <- 
+round(abs(as.numeric(as.matrix(summary(soc_com_pairwise_obj))[,"estimate"])/soc_com_resid_SE),3)
+#
+sens_reg_resid_SE <- sqrt(anova(sens_reg_anova)$`Mean Sq`[3])
+sens_reg_cohens_d_vector <- 
+round(abs(as.numeric(as.matrix(summary(sens_reg_pairwise_obj))[,"estimate"])/sens_reg_resid_SE),3)
+#
+tot_risk_resid_SE <- sqrt(anova(tot_risk_anova)$`Mean Sq`[3])
+tot_risk_cohens_d_vector <- 
+round(abs(as.numeric(as.matrix(summary(tot_risk_pairwise_obj))[,"estimate"])/tot_risk_resid_SE),3)
+
+cohens_d_table <- rbind(soc_com_cohens_d_vector, sens_reg_cohens_d_vector,
+                        tot_risk_cohens_d_vector)
+pairwise_anova[] <- paste(pairwise_anova, 
+                          paste("(",cohens_d_table, ")",sep=""), 
+                          sep=" ")
+anova_table <- cbind(anova_table, pairwise_anova)
+
+
+kable(anova_table, 
+      col.names = colnames(anova_table), 
+      caption="Comparison of group means from regression of domain risk score on diagnosis group, controlling for respondant's education.  Estimated group means and their corresponding standard errors (SE), rounded to two decimal spaces, are provided for each domain.  These comparisons were done for Social Communication and Sensory Regulation domains and Total Risk Score.  For each of these, the p-value and test statistic corresponding to the ANOVA F-test for group differences with degrees of freedom in parentheses is reported, along with the p-values for the post-hoc pairwise comparisons.  The Holm adjustment was used for these pairwise comparisons to correct for multiple comparisons.  Cohen's D is also reported in parentheses for each pairwise comparison, defined as the estimated contrast divided by the residual standard error.") %>% 
+  kable_styling() 
+```
+
+We also test for group diffences in the construct scores, with the same unadjusted and adjusted models as were used in the domain score analyses.
+
+```{r ANOVA_3, eval=T}
+dataset_sum_v3 <- dataset_sum_v2 %>%
+  select(V12.fyi_orientrec:V12.fyi_senproc, Groups_NoAtyp, respond_educ)
+
+# Save construct variable names, create lists to hold ANOVA fit results and table results
+construct_vars <- names(dataset_sum_v3)[grepl("fyi", names(dataset_sum_v3))]
+anova_frmls <- paste(construct_vars, "Groups_NoAtyp", sep="~")
+anova_list <- list()
+for_table_list <- list()
+F_stat_list <- list()
+F_stat_pval_list <- list()
+Pairwise_ttest_list <- list()
+Pairwise_ttest_list_vect <- list()
+cohens_d_list <- list()
+cohens_d_list_vect <- list()
+
+order_cohen <- c("Low Risk", "High Risk: ASD", "High Risk: No ASD")
+
+# Run ANOVA analyses for each construct variable; also do F tests for group
+for(i in 1:length(construct_vars)){
+  anova_list[[i]] <- lm(anova_frmls[[i]], data=dataset_sum_v3)
+  for_table_list_temp <- as.data.frame(lsmeans(anova_list[[i]], specs="Groups_NoAtyp")) %>%
+    mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" "))  %>%
+  select(Groups_NoAtyp, Mean_SE)
+  
+  for_table_list_temp <- t(for_table_list_temp)
+  colnames(for_table_list_temp) <- for_table_list_temp[1,]
+  for_table_list_temp <- for_table_list_temp[-1,]
+  for_table_list_temp <- c("Construct"=construct_vars[[i]], for_table_list_temp)
+  for_table_list[[i]] <- for_table_list_temp
+  
+  # Now do F stat calc.
+  F_stat_list[[i]] <- paste( round(anova(anova_list[[i]])$`F value`[1],2), 
+                         paste("(",anova(anova_list[[i]])$Df[1],",",
+                               anova(anova_list[[i]])$Df[2],")", sep=""), sep=" ")
+  
+  F_stat_pval_list[[i]] <- ifelse(anova(anova_list[[i]])$`Pr(>F)`[1]>0.001,
+                         round(anova(anova_list[[i]])$`Pr(>F)`[1],3),"<0.001") 
+  
+  # Calculate pairwise t-tests
+  ttest_expression <- paste0("dataset_sum_v3", "$", construct_vars[i])
+  Pairwise_ttest_list[[i]] <- pairwise.t.test(eval(parse(text=ttest_expression)),
+                dataset_sum_v3$Groups_NoAtyp)$p.value
+  Pairwise_ttest_list_vect[[i]] <- ifelse(as.vector(Pairwise_ttest_list[[i]])<0.001,
+                                  "<0.001",
+                                  round(as.vector(Pairwise_ttest_list[[i]]),3))
+  
+  # Calc. Cohen's D
+  cohens_d_list[[i]] <- calc_cohens_d(outcome=construct_vars[i],
+                                   group_var = "Groups_NoAtyp",
+                                   data=dataset_sum_v3,
+                                   order=order_cohen)
+  
+  cohens_d_list_vect[[i]] <- unlist(cohens_d_list[[i]])
+}
+
+## Combine into single table
+anova_table <- do.call("rbind", for_table_list)
+anova_table <- cbind(anova_table, 
+                     "F Statistic"=unlist(F_stat_list),
+                     "P-value"=unlist(F_stat_pval_list))
+
+## Add in multiple comps
+cohens_d_table <- do.call("rbind", cohens_d_list_vect)
+pairwise_anova <- do.call("rbind", Pairwise_ttest_list_vect)
+
+colnames(pairwise_anova) <- c(paste(colnames(Pairwise_ttest_list[[1]])[1], rownames(Pairwise_ttest_list[[1]]), sep=" vs "),
+                                paste(colnames(Pairwise_ttest_list[[1]])[2], rownames(Pairwise_ttest_list[[1]]), sep=" vs "))
+
+rownames(pairwise_anova) <- NULL
+
+pairwise_anova <- t(t(pairwise_anova)[complete.cases(t(pairwise_anova)),])
+pairwise_anova[] <- paste(pairwise_anova, 
+                          paste("(",cohens_d_table, ")",sep=""), 
+                          sep=" ")
+anova_table_final <- cbind(anova_table, pairwise_anova)
+
+kable(anova_table_final, 
+      col.names = colnames(anova_table_final), 
+      caption="Comparison of group means from regression of construct risk score on diagnosis group.  Estimated group means and their corresponding standard errors (SE), rounded to two decimal spaces, are provided for each construct.  For each construct, the p-value and test statistic corresponding to the ANOVA F-test for group differences is reported with degrees of freedom for the F statistic in paretheses, along with the p-values for the post-hoc pairwise comparisons.  The Holm adjustment was used for these pairwise comparisons to correct for multiple comparisons.  Cohen's D effect size is also reported in parentheses for each of these comparisons. ") %>% 
+  kable_styling() 
+```
+
+```{r ANOVA_4, eval=T}
+anova_frmls <- paste(construct_vars, "Groups_NoAtyp+respond_educ", sep="~")
+anova_list <- list()
+for_table_list <- list()
+F_stat_list <- list()
+F_stat_pval_list <- list()
+Pairwise_ttest_list <- list()
+Pairwise_ttest_list_vect <- list()
+cohens_d_list <- list()
+cohens_d_list_vect <- list()
+
+order_cohen <- c("Low Risk", "High Risk: ASD", "High Risk: Atypical")
+Contrasts = list(Low_Risk_vs_High_Risk__ASD = c(1,  -1,  0),
+                 Low_Risk_vs_High_Risk__No_ASD = c(1,  0,  -1),
+                 High_Risk__ASD_vs_High_Risk__No_ASD = c( 0,  1, -1))
+
+# Run ANOVA analyses for each construct variable; also do F tests for group
+for(i in 1:length(construct_vars)){
+  anova_list[[i]] <- lm(anova_frmls[[i]], data=dataset_sum_v3)
+  for_table_list_temp <- as.data.frame(lsmeans(anova_list[[i]], specs="Groups_NoAtyp",
+                                               at=list(respond_educ="Coll"))) %>%
+    mutate(Mean_SE=paste(round(lsmean,2), 
+                       paste("(",round(lower.CL,2),", ",round(upper.CL,2),")",sep=""),sep=" "))  %>%
+  select(Groups_NoAtyp, Mean_SE)
+  
+  for_table_list_temp <- t(for_table_list_temp)
+  colnames(for_table_list_temp) <- for_table_list_temp[1,]
+  for_table_list_temp <- for_table_list_temp[-1,]
+  for_table_list_temp <- c("Construct"=construct_vars[[i]], for_table_list_temp)
+  for_table_list[[i]] <- for_table_list_temp
+  
+  # Now do F stat calc.
+  F_stat_list[[i]] <- paste( round(anova(anova_list[[i]])$`F value`[1],2), 
+                         paste("(",anova(anova_list[[i]])$Df[1],",",
+                               anova(anova_list[[i]])$Df[2],")", sep=""), sep=" ")
+  
+  F_stat_pval_list[[i]] <- ifelse(anova(anova_list[[i]])$`Pr(>F)`[1]>0.001,
+                         round(anova(anova_list[[i]])$`Pr(>F)`[1],3),"<0.001") 
+  
+  # Calculate pairwise t-tests
+soc_com_pairwise_vector <- ifelse(soc_com_pairwise$p.value<0.001, "<0.001",
+                                   round(soc_com_pairwise$p.value, 3))
+  
+  ttest_temp <- contrast(lsmeans(anova_list[[i]], "Groups_NoAtyp",
+                                           at=list(respond_educ="Coll")), 
+                                 Contrasts, 
+                                 adjust = "holm")
+  Pairwise_ttest_list[[i]] <- as.data.frame(summary(ttest_temp))[,c("contrast",                                                               "p.value")]
+  Pairwise_ttest_list_vect[[i]] <- ifelse(Pairwise_ttest_list[[i]]$p.value<0.001, "<0.001",
+                                   round(Pairwise_ttest_list[[i]]$p.value, 3))
+  
+  # Calc. Cohen's D
+  resid_SE <- sqrt(anova(anova_list[[i]])$`Mean Sq`[3])
+  cohens_d_list_vect[[i]] <- 
+  round(abs(as.numeric(as.matrix(summary(ttest_temp))[,"estimate"])/resid_SE),3)
+}
+
+## Combine into single table
+anova_table <- do.call("rbind", for_table_list)
+anova_table <- cbind(anova_table, 
+                     "F Statistic"=unlist(F_stat_list),
+                     "P-value"=unlist(F_stat_pval_list))
+
+## Add in multiple comps
+cohens_d_table <- do.call("rbind", cohens_d_list_vect)
+pairwise_anova <- do.call("rbind", Pairwise_ttest_list_vect)
+
+colnames(pairwise_anova) <- gsub("  ", ": ",
+                                 gsub("_"," ",Pairwise_ttest_list[[1]]$contrast))
+
+rownames(pairwise_anova) <- NULL
+
+pairwise_anova[] <- paste(pairwise_anova, 
+                          paste("(",cohens_d_table, ")",sep=""), 
+                          sep=" ")
+anova_table_final <- cbind(anova_table, pairwise_anova)
+
+kable(anova_table_final, 
+      col.names = colnames(anova_table_final), 
+      caption="Comparison of group means from regression of construct risk score on diagnosis group, controlling for respondant's education.  Estimated group means and their corresponding standard errors (SE), rounded to two decimal spaces, are provided for each construct.  For each construct, the p-value and test statistic corresponding to the ANOVA F-test for group differences is reported with degrees of freedom for the F statistic in paretheses, along with the p-values for the post-hoc pairwise comparisons.  The Holm adjustment was used for these pairwise comparisons to correct for multiple comparisons.  Cohen's D effect size is also reported in parentheses for each of these comparisons. ") %>% 
+  kable_styling() 
+```
+
+
+# Prediction Analysis: ASD Positive vs ASD Negative
+## Full Dataset
+```{r freq_tables, eval=F}
+# Look at group splits in test, valid sets
+x <- table(dataset_HR$Groups_2) 
+names(dimnames(x)) <- "Diagnosis frequencies: Full dataset"
+x
+```
+
+### Prediction using Random Forest
+## Using all questions
+Now, let's consider prediction of diagnosis using Random Forest with the 60 FYI questions.  The prediction goal is to classify children as ASD or Negative based on the 60 FYI questions.  
+
+This analysis is done in two parts: 1) create prediction algorithm, 2) estimate the algorithm's prediction accuracy when applied to a separate dataset from this high risk population.  For 1), we first balance the outcome classes using SMOTE.  Random Forest does poorly when it is given an unbalanced dataset to train on; SMOTE corrects for this.  The tuning parameters are a) number of trees and b) number of predictors considered at each split.  For a), we use the out of bag error rates to find the loweest number of trees where the error rate stablize.  For b), we try each choice of number of predictors (1 through 60) using the choice in a) and find where the error rate in the ASD class is the lowest; if there are ties, we choose the smallest number from these ties.  We report the training set performance first before showing the analysis for 2).
+
+For 2), the following procedure was done.  First we conduct 5 fold cross valiation starified by diagnosis group on the data.  Due to the large imbalance in ASD diagnosis in the bootstrap sample, we use SMOTE on the training set to rebalance the classes with $200\%$ oversampling of the minority class (ASD positive).  Then, we repeat the tuning parameters proces from 1) with these training set.  We then fit RF on the training set using these tuned parameters, and then evaluate the algorithm's performance on the bootstrap test set by calculating sensitivity, specificity, positive predictive value (PPV), negative predictive value (NPV), and area under the ROC curve (AUC).  Finally, we repeat this process **50 times.**  This provides a set of **250** sensitivities, specificities, etc.  We report the mean and standard deviation of these 250 measures.  This provides both an estimate of the algortihm's expected performance on a general dataset separate from the given data, as well as an assessment of the variance of this performance.  This process is referred to as **repeated 5 fold cross validation**.
+
+Lastly, we take the RF generated from the entire HR sample without missing values and apply it to the LR-Neg (LR-ASD has sample size of 1 so this group is omitted) sample (again without missing values) as a way of testing this algorthim in a non-HR group
+
+```{r two_cat_ASD, eval=F}
+## For ASD vs Neg
+dataset_HR_RF <- dataset_HR %>%
+  select(Groups_2, FYIq_1:FYIq_60)
+
+ftable(dataset_HR_RF$Groups_2) # Large imbalance, need to oversample
+
+# Oversample
+set.seed(012)
+dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~., 
+                                    data=data.frame(dataset_HR_RF), 
+                                    perc.over = 200,
+                                    k=5, 
+                                    learner = NULL))
+
+x <- table(dataset_HR_RF$Groups_2) 
+names(dimnames(x)) <- "Diagnois frequencies: Full dataset"
+x
+
+x <- table(dataset_HR_RF_SMOTE$Groups_2) 
+names(dimnames(x)) <- "Diagnois frequencies: Full dataset after SMOTE"
+x
+
+# Run RF
+RF_ASD_test <- randomForest(Groups_2~., 
+                                   data=dataset_HR_RF_SMOTE, ntree=5000)
+plot(RF_ASD_test)
+legend(4000, 0.3, legend=c("HR_Neg", "HR_ASD","Total"), col=c("red","green",
+                                                             "black"),cex=0.8,lty=1)
+# Find stable value
+rle_wholedata <- rle(RF_ASD_test$err.rate[,"OOB"])
+rle_wholedata_lengths <- rle_wholedata$lengths
+rle_wholedata_lengths_srt <- sort(rle_wholedata$lengths, decreasing=TRUE)
+longest_string_wholedata <- 
+which(rle_wholedata_lengths==rle_wholedata_lengths_srt[1])
+
+# Set number of trees
+stable_tree_no_wholedata <- sum(rle_wholedata_lengths[1:longest_string_wholedata-1])+1
+
+## Find number of predictors at each split
+# Do same error analysis as before
+max_num_pred <- 15
+oob.err_2=matrix(NA,max_num_pred,3); colnames(oob.err_2) <- c("OOB","HR_Neg", "HR_ASD")
+
+for(mtry in 1:max_num_pred) 
+{
+  rf=randomForest(Groups_2~., data=dataset_HR_RF_SMOTE,mtry=mtry,
+                  ntree=stable_tree_no_wholedata) 
+  oob.err_2[mtry,] = rf$err.rate[stable_tree_no_wholedata,] #Error of all Trees fitted
+  
+ # cat(mtry," ") #printing the output to the console
+  
+}
+# Find which mtry produced lowest pred. error in test set
+mintest_OOB_wholedata <- which(oob.err_2[,"OOB"]==min(oob.err_2[,"OOB"]))
+print("Error rates in OOB set")
+oob.err_2[mintest_OOB_wholedata,] # same Neg error, take smallest
+
+## Generate final RF algorthim
+rf_ASD_final <- randomForest(Groups_2~., 
+                                   data=dataset_HR_RF_SMOTE,
+                             ntree=stable_tree_no_wholedata,
+                             mtry=mintest_OOB_wholedata)
+
+# Training set performance
+rf_ASD_final
+
+var_importance <- as.matrix(rf_ASD_final$importance[order(rf_ASD_final$importance,decreasing = T),])
+
+variables_importance_rank <- rownames(var_importance)
+
+# Save algorithm as a function to allow prediction using any (correctly formatted) dataset
+rf_ASD_predict <- function(dataset, thres="best"){
+  rf_predict_probs <- predict(rf_ASD_final, data=dataset, type = "prob")
+  dataset_string <- paste("dataset", "$", "Groups_2", sep="")
+  rf_predict_roc <- roc(response=eval(parse(text=dataset_string)),
+                              predictor=rf_predict_probs[,2])
+  if(thres=="best"){
+    best_rf_thres <- coords(rf_predict_roc,
+                          x="best", ret="threshold",
+                          best.method = "closest.topleft")
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>best_rf_thres[1],
+                                        "HR_ASD", "HR_Neg"))
+  }else{
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>thres,
+                                        "HR_ASD", "HR_Neg"))
+  }
+  output <- list("rf_predicted_probabilities" = rf_predict_probs, "rf_predicted_classes" = rf_predict_classes,
+                 "rf_confusion_matrix" = confusionMatrix(data=rf_predict_classes,
+                                        reference=eval(parse(text=dataset_string)),
+                                        positive="HR_ASD"),
+                 "rf_roc_object" = rf_predict_roc, "rf_auc" = pROC::auc(rf_predict_roc),
+                 "rf_roc_plot" = plot(rf_predict_roc))
+  return(output)
+}
+
+# Save algorthim itself as object
+save(rf_ASD_final, file = "rf_ASD_final.RData")
+```
+
+```{r two_cat_RF_table, eval=F}
+## Repeated cross validation
+RF_Group_2_ALLQs_ROC_CV <- list()
+RF_confmatrix_CV <- list()
+RF_summary_results_CV <- list()
+RF_accuracy_CV <- list()
+RF_AUC_CV <- list()
+fold_ASD_counts <- list()
+
+RF_confmatrix_CV_NoAtyp <- list()
+RF_summary_results_CV_NoAtyp <- list()
+
+RF_confmatrix_CV_NoTyp <- list()
+RF_summary_results_CV_NoTyp<- list()
+
+boots <- 50
+fold_num <- 5
+
+dataset_HR_CV <- dataset_HR
+
+for(i in 1:boots){
+  #print(i)
+  set.seed(i)
+  ## Create folds
+  folds <- createFolds(dataset_HR_CV$Groups_2, k=fold_num, list=F)
+  dataset_HR_CV$fold <- folds
+  # Check proportions:
+  # plyr::ddply(dataset_HR_CV, 'fold', summarise, prop=mean(as.numeric(Groups_2)-1))
+ for(j in 1:fold_num){  
+  print(j)
+  dataset_valid_2 <- dataset_HR_CV %>% filter(fold==j) %>% select(Groups, Groups_2,
+                                                                  FYIq_1:FYIq_60)
+  dataset_test_2 <- dataset_HR_CV %>% filter(fold!=j) %>% select(Groups_2,
+                                                                  FYIq_1:FYIq_60)
+
+  set.seed(012)
+  dataset_test_2_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~.,
+                                      data=data.frame(dataset_test_2),
+                                      perc.over = 200,
+                                      k=5,
+                                      learner = NULL))
+  ftable(dataset_test_2_SMOTE$Groups_2)
+  CV_rf <- randomForest(Groups_2~., data=dataset_test_2_SMOTE, ntree=5000)
+
+  # Find stable value
+  rle_cv <- rle(CV_rf$err.rate[,"OOB"])
+  rle_cv_lengths <- rle_cv$lengths
+  rle_cv_lengths_srt <- sort(rle_cv_lengths, decreasing=TRUE)
+  longest_string_cv <-
+  which(rle_cv_lengths==rle_cv_lengths_srt[1])
+
+  # Set number of trees
+  stable_tree_no_cv <- sum(rle_cv_lengths[1:longest_string_cv-1])+1
+
+  ## Find number of predictors at each split
+  # Do same error analysis as before
+  oob.err_cv=matrix(NA,max_num_pred,3); colnames(oob.err_cv) <- c("OOB","HR_Neg", "HR_ASD")
+
+  for(mtry in 1:max_num_pred)
+  {
+    rf=randomForest(Groups_2~., data=dataset_test_2_SMOTE,mtry=mtry,
+                    ntree=stable_tree_no_cv)
+    oob.err_cv[mtry,] = rf$err.rate[stable_tree_no_cv,] #Error of all Trees fitted
+
+   # cat(mtry," ") #printing the output to the console
+
+  }
+  # Find which mtry produced lowest pred. error in test set
+  mintest_OOB_cv <- which(oob.err_cv[,"OOB"]==min(oob.err_cv[,"OOB"]))
+
+  # Run final RF on test set
+  CV_rf_test <- randomForest(Groups_2~., data=dataset_test_2_SMOTE,
+                             ntree=stable_tree_no_cv, mtry=mintest_OOB_cv)
+
+  # Plot ROC curve with AUC
+  pred_probs_rf <- predict(CV_rf_test,dataset_valid_2, type="prob")
+  RF_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+j]] <- roc(response=dataset_valid_2$Groups_2,
+                              predictor=pred_probs_rf[,2])
+
+  # Get confusion matrix of best mtry at best threshold
+  best_rf_thres <- coords(RF_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+j]],
+                          x="best", ret="threshold",
+                          best.method = "closest.topleft")
+  RF_Group2_ALLQs_pred <- factor(ifelse(pred_probs_rf[,2]>best_rf_thres[1],
+                                        "HR_ASD", "HR_Neg"))
+  RF_confmatrix_CV[[fold_num*(i-1)+j]] <- confusionMatrix(data=RF_Group2_ALLQs_pred,
+                                        reference=dataset_valid_2$Groups_2,
+                                        positive="HR_ASD")
+
+  RF_accuracy_CV[[fold_num*(i-1)+j]] <- RF_confmatrix_CV[[fold_num*(i-1)+j]]$overall["Accuracy"]
+  RF_summary_results_CV[[fold_num*(i-1)+j]] <- RF_confmatrix_CV[[fold_num*(i-1)+j]]$byClass
+  RF_AUC_CV[[fold_num*(i-1)+j]] <- pROC::auc(RF_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+j]])
+  fold_ASD_counts[[fold_num*(i-1)+j]] <- sum(dataset_HR_CV %>% filter(fold==j) %>% select(Groups_2)=="HR_ASD")
+  
+  # Also, calculate sensitivity and specificity when we remove Atypicals from the test fold
+  dataset_valid_2_NoAtyp <- dataset_valid_2 %>% filter(Groups%in%c("HR_ASD", "HR_typ"))
+  RF_Group2_ALLQs_pred_NoAtyp <- RF_Group2_ALLQs_pred[dataset_valid_2$Groups%in%c("HR_ASD", "HR_typ")]
+  
+  RF_confmatrix_CV_NoAtyp[[fold_num*(i-1)+j]] <- confusionMatrix(data=RF_Group2_ALLQs_pred_NoAtyp,
+                                        reference=dataset_valid_2_NoAtyp$Groups_2,
+                                        positive="HR_ASD")
+  RF_summary_results_CV_NoAtyp[[fold_num*(i-1)+j]] <- RF_confmatrix_CV_NoAtyp[[fold_num*(i-1)+j]]$byClass
+
+  # For completeness, do same after removing Typicals from test fold
+  dataset_valid_2_NoTyp <- dataset_valid_2 %>% filter(Groups%in%c("HR_ASD", "HR_Atyp"))
+  RF_Group2_ALLQs_pred_NoTyp <- RF_Group2_ALLQs_pred[dataset_valid_2$Groups%in%c("HR_ASD", "HR_Atyp")]
+  
+  RF_confmatrix_CV_NoTyp[[fold_num*(i-1)+j]] <- confusionMatrix(data=RF_Group2_ALLQs_pred_NoTyp,
+                                        reference=dataset_valid_2_NoTyp$Groups_2,
+                                        positive="HR_ASD")
+  RF_summary_results_CV_NoTyp[[fold_num*(i-1)+j]] <- RF_confmatrix_CV_NoTyp[[fold_num*(i-1)+j]]$byClass
+ }
+}
+
+# Print out mean ASD cases per fold
+mean(unlist(fold_ASD_counts))
+
+# Extract sensitivites, specificies, PPV, NPV, AUC
+RF_all_results_table <- data.frame(do.call(rbind, RF_summary_results_CV))
+RF_AUC_all <- unlist(RF_AUC_CV)
+
+# Do same for No Atyp, No Typ analysis
+RF_all_results_table_NoAtyp <- data.frame(do.call(rbind, RF_summary_results_CV_NoAtyp))
+RF_all_results_table_NoTyp <- data.frame(do.call(rbind, RF_summary_results_CV_NoTyp))
+
+# Summarize results in table
+sensitivity_ci <- c(paste(round(mean(RF_all_results_table$Sensitivity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table$Sensitivity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table$Sensitivity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+specificity_ci <- c(paste(round(mean(RF_all_results_table$Specificity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table$Specificity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table$Specificity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+ppv_ci <-  c(paste(round(mean(RF_all_results_table$Pos.Pred.Value),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table$Pos.Pred.Value, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table$Pos.Pred.Value, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+npv_ci <-  c(paste(round(mean(RF_all_results_table$Neg.Pred.Value),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table$Neg.Pred.Value, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table$Neg.Pred.Value, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+MCR_ci <- c(paste(round(mean(1-unlist(RF_accuracy_CV)),2),
+                      paste("(",
+                    round(quantile(1-unlist(RF_accuracy_CV), prob=c(0.025)),2), ", ",
+                    round(quantile(1-unlist(RF_accuracy_CV), prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+AUC_ci <-  c(paste(round(mean(RF_AUC_all),2),
+                      paste("(",
+                    round(quantile(RF_AUC_all, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_AUC_all, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+
+RF_summary_results_table <- matrix(c(sensitivity_ci, specificity_ci,
+                                     ppv_ci, npv_ci, MCR_ci, AUC_ci),
+                                   nrow=1)
+RF_summary_results_table <- data.frame(RF_summary_results_table)
+names(RF_summary_results_table) <- c("Sensitivity", "Specificity","PPV","NPV","MCR","AUC")
+
+kable(as.matrix(RF_summary_results_table),
+      caption=paste("Estimated performance measures of random forest algorithm in predicting ASD diagnosis using all 60 FYI questions as predictors.  The estimated mean and estimated standard deviation are provided,which were calculated using ", boots ," time repeated 5-fold cross validation.")) %>%
+  kable_styling()
+
+# Add in results after removing ATypicals and Typicals
+# Removing Atypicals
+sensitivity_ci_NoAtyp <- c(paste(round(mean(RF_all_results_table_NoAtyp$Sensitivity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table_NoAtyp$Sensitivity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table_NoAtyp$Sensitivity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+specificity_ci_NoAtyp <- c(paste(round(mean(RF_all_results_table_NoAtyp$Specificity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table_NoAtyp$Specificity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table_NoAtyp$Specificity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+
+# Removing Typicals
+sensitivity_ci_NoTyp <- c(paste(round(mean(RF_all_results_table_NoTyp$Sensitivity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table_NoTyp$Sensitivity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table_NoTyp$Sensitivity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+specificity_ci_NoTyp <- c(paste(round(mean(RF_all_results_table_NoTyp$Specificity),2),
+                      paste("(",
+                    round(quantile(RF_all_results_table_NoTyp$Specificity, prob=c(0.025)),2), ", ",
+                    round(quantile(RF_all_results_table_NoTyp$Specificity, prob=c(0.975)),2),
+                    ")",sep=""), sep=" "))
+
+# Combine into single table
+RF_summary_results_table <- rbind(c(sensitivity_ci, specificity_ci,
+                                     ppv_ci, npv_ci, MCR_ci, AUC_ci),
+                                  c(sensitivity_ci_NoAtyp, specificity_ci_NoAtyp, rep(NA, 4)),
+                                  c(sensitivity_ci_NoTyp, specificity_ci_NoTyp, rep(NA, 4)))
+RF_summary_results_table <- data.frame(RF_summary_results_table)
+names(RF_summary_results_table) <- c("Sensitivity", "Specificity","PPV","NPV","MCR","AUC")
+row.names(RF_summary_results_table) <- c("HR Sample", "Removing Atypicals", "Removing Typicals")
+
+kable(as.matrix(RF_summary_results_table), 
+      caption=paste("Estimated performance measures of random forest algorithm in predicting ASD diagnosis using all 60 FYI questions as predictors.  The estimated mean and estimated standard deviation are provided,which were calculated using ", boots ," time repeated 5-fold cross validation.  These values are reported using the entire HR Sample, after removing the HR Atypical infants from the test folds (Removing Atypicals) and after removing the HR Typical infants from the test folds (Removing Typicals (only sensitivity and specificity reported for the last two scenarios.")) %>%
+  kable_styling()
+
+# Look at variable importance
+kable(var_importance, caption="Variable importance index scores from prediction of ASD using random forest with all questions, on the entire dataset. Higher implies score greater importance",digits=2) %>%
+  kable_styling()
+```
+
+### Test on LR sample
+Now we test the random forest classifier from the HR sample onto the LR sample (thus, the LR sample is an independent dataset).  Due to the lack of LR ASD children (the only LR ASD child has a missing value for FYI question 1), we can only look at the specificity of the RF within this group.  We predict using a 50% probability threshold; due to the lack of ASD children, calculating a ROC curve and finding the "best threshold" on the LR sample does not make sense (as we can simple make the specificity equal to 1).
+
+```{r test_RF_LR, eval=F}
+## For LR, all are Negative
+dataset_LR_RF <- dataset_v2 %>%
+  filter(grepl("LR",Groups)) %>%
+  mutate(Groups_2=factor(ifelse(Groups=="LRASD","HR_ASD", "HR_Neg"))) %>%
+  select(Groups_2, FYIq_1:FYIq_60)
+
+dataset_LR_RF <- dataset_v2 %>%
+  filter(Groups=="LR"|Groups=="LR_Atyp") %>%
+  mutate(Groups_2=factor(ifelse(Groups=="LRASD","HR_ASD", "HR_Neg"))) %>%
+  select(Groups_2, FYIq_1:FYIq_60)
+
+ftable(dataset_LR_RF$Groups_2)
+
+# Calculate estimated probabilities from ROC curve
+LR_predict <- predict(rf_ASD_final,dataset_LR_RF, type="prob")
+#LR_ROC <- roc(response=dataset_LR_RF$Groups_2,
+                              #predictor=LR_predict[,2])
+
+# Calculate best threshold from ROC curve and predicting using best thres and 50% thres
+#best_LR_thres <- coords(LR_ROC,
+                          #x="best", ret="threshold",
+                          #best.method = "closest.topleft")
+#RF_LR_ALLQs_pred_bestthres <- factor(ifelse(LR_predict[,2]>best_LR_thres[1],"HR_ASD", "HR_Neg"))
+RF_LR_ALLQs_pred_50percent <- factor(ifelse(LR_predict[,2]>0.5,
+                                        "HR_ASD", "HR_Neg"))
+
+# Calculate corresponding confusion matricies
+#RF_confmatrix_LR_bestthres <- confusionMatrix(data=RF_LR_ALLQs_pred_bestthres,
+#                                        reference=dataset_LR_RF$Groups_2,
+#                                        positive="HR_ASD")
+RF_confmatrix_LR_50percent <- confusionMatrix(data=RF_LR_ALLQs_pred_50percent,
+                                        reference=dataset_LR_RF$Groups_2,
+                                        positive="HR_ASD")
+
+RF_confmatrix_LR_50percent$table
+RF_confmatrix_LR_50percent$byClass["Specificity"]
+```
+
+## FYI Lite
+Using the variable importance results from the above random forest analysis, let us see if we can maintain this prediction performance while keeping only a subset of these questions.  We try the following: 1) top 5 questions, 2) top 10 questions, 3) top 20 questions, and 4) top 30 questions.  We repeat the above random forest analyses for each of these thresholds
+
+```{r FYI_Lite_ASD, eval=F}
+stable_tree_no_wholedata <- list()
+mintest_OOB_wholedata <- list()
+rf_ASD_final <- list()
+
+## Set thresholds
+thresholds <- c(1, 2, 4, 7, 20, 30)
+
+for(i in 1:length(thresholds)){
+  questions_subset <- variables_importance_rank[1:thresholds[i]]
+  ## For ASD vs Neg
+  dataset_HR_RF <- dataset_HR %>%
+    select("Groups_2", questions_subset)
+  
+  ftable(dataset_HR_RF$Groups_2) # Large imbalance, need to oversample
+  
+  # Oversample
+  set.seed(012)
+  dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~., 
+                                      data=data.frame(dataset_HR_RF), 
+                                      perc.over = 200,
+                                      k=5, 
+                                      learner = NULL))
+  
+  x <- table(dataset_HR_RF$Groups_2) 
+  names(dimnames(x)) <- "Diagnois frequencies: Full dataset"
+  x
+  
+  x <- table(dataset_HR_RF_SMOTE$Groups_2) 
+  names(dimnames(x)) <- "Diagnois frequencies: Full dataset after SMOTE"
+  x
+  
+  # Run RF
+  RF_ASD_test <- randomForest(Groups_2~., 
+                                     data=dataset_HR_RF_SMOTE, ntree=5000)
+  # Find stable value
+  rle_wholedata <- rle(RF_ASD_test$err.rate[,"OOB"])
+  rle_wholedata_lengths <- rle_wholedata$lengths
+  rle_wholedata_lengths_srt <- sort(rle_wholedata$lengths, decreasing=TRUE)
+  longest_string_wholedata <- 
+  which(rle_wholedata_lengths==rle_wholedata_lengths_srt[1])
+  
+  # Set number of trees
+  stable_tree_no_wholedata[[i]] <- sum(rle_wholedata_lengths[1:longest_string_wholedata-1])+1
+  
+  ## Find number of predictors at each split
+  # Do same error analysis as before
+  max_num_pred <- thresholds[i]
+  oob.err_2=matrix(NA,max_num_pred,3); colnames(oob.err_2) <- c("OOB","HR_Neg", "HR_ASD")
+  
+  for(mtry in 1:max(max_num_pred, thresholds[i])){
+    rf=randomForest(Groups_2~., data=dataset_HR_RF_SMOTE,mtry=mtry,
+                    ntree=stable_tree_no_wholedata[[i]]) 
+    oob.err_2[mtry,] = rf$err.rate[stable_tree_no_wholedata[[i]],] #Error of all Trees fitted
+    
+   # cat(mtry," ") #printing the output to the console
+    
+  }
+  # Find which mtry produced lowest pred. error in test set
+  mintest_OOB_wholedata[[i]] <- which(oob.err_2[,"OOB"]==min(oob.err_2[,"OOB"]))
+  print("Error rates in OOB set")
+  oob.err_2[mintest_OOB_wholedata[[i]],] # same Neg error, take smallest
+  
+  ## Generate final RF algorthim
+  rf_ASD_final[[i]] <- randomForest(Groups_2~., 
+                                     data=dataset_HR_RF_SMOTE,
+                               ntree=stable_tree_no_wholedata[[i]],
+                               mtry=mintest_OOB_wholedata[[i]])
+}
+```
+
+```{r FYI_Lite_ASD_Btst, eval=F, results="asis"}
+## Repeated cross validation
+RF_Lite_Group_2_ALLQs_ROC_CV <- list()
+
+RF_Lite_accuracy <- list()
+RF_Lite_all_results_table <- list()
+RF_Lite_AUC_all <- list()
+
+RF_Lite_summary_results_table <- list()
+sensitivity_lite_ci <- list()
+specificity_lite_ci <- list()
+ppv_lite_ci <- list()
+npv_lite_ci <- list()
+MCR_lite_ci <- list()
+AUC_lite_ci <- list()
+
+boots <- 50
+fold_num <- 5
+
+for(j in 1:length(thresholds)){
+  #print(paste("j=",j, sep=""))
+  questions_subset <- variables_importance_rank[1:thresholds[j]]
+  
+  RF_Lite_confmatrix_CV <- list()
+  RF_Lite_summary_results_CV <- list()
+  RF_Lite_accuracy_CV <- list()
+  RF_Lite_AUC_CV <- list()
+  
+for(i in 1:boots){
+  #(paste("i=",i, sep=""))
+  ## Create test/training, validation sets
+  dataset_HR_CV <- dataset_HR
+  set.seed(i)
+  folds <- createFolds(dataset_HR_CV$Groups_2, k=fold_num, list=F)
+  dataset_HR_CV$fold <- folds
+  # Check proportions:
+  # plyr::ddply(dataset_HR_CV, 'fold', summarise, prop=mean(as.numeric(Groups_2)-1))
+ for(f in 1:fold_num){  
+  # print(paste("fold=",f, sep=""))
+  dataset_valid_2 <- dataset_HR_CV %>% filter(fold==f) %>% select(Groups_2,
+                                                                  questions_subset)
+  dataset_test_2 <- dataset_HR_CV %>% filter(fold!=f) %>% select(Groups_2,
+                                                                  questions_subset) 
+  
+  set.seed(012)
+  dataset_test_2_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~., 
+                                      data=data.frame(dataset_test_2), 
+                                      perc.over = 200,
+                                      k=5, 
+                                      learner = NULL))
+  ftable(dataset_test_2_SMOTE$Groups_2)
+  CV_rf <- randomForest(Groups_2~., data=dataset_test_2_SMOTE, ntree=5000) 
+  
+  # Find stable value
+  rle_cv <- rle(CV_rf$err.rate[,"OOB"])
+  rle_cv_lengths <- rle_cv$lengths
+  rle_cv_lengths_srt <- sort(rle_cv_lengths, decreasing=TRUE)
+  longest_string_cv <- 
+  which(rle_cv_lengths==rle_cv_lengths_srt[1])
+  
+  # Set number of trees
+  stable_tree_no_cv <- sum(rle_cv_lengths[1:longest_string_cv-1])+1
+  
+  ## Find number of predictors at each split
+  # Do same error analysis as before
+  max_preds_lite <- ifelse(thresholds[j]<max_num_pred, thresholds[j], max_num_pred)
+  oob.err_cv=matrix(NA,max_preds_lite,3); colnames(oob.err_cv) <- c("OOB","HR_Neg", "HR_ASD")
+  
+  for(mtry in 1:max_preds_lite){ 
+    rf=randomForest(Groups_2~., data=dataset_test_2_SMOTE,mtry=mtry,
+                    ntree=stable_tree_no_cv) 
+    oob.err_cv[mtry,] = rf$err.rate[stable_tree_no_cv,] #Error of all Trees fitted
+    
+   # cat(mtry," ") #printing the output to the console
+    
+  }
+  # Find which mtry produced lowest pred. error in test set
+  mintest_OOB_cv <- which(oob.err_cv[,"OOB"]==min(oob.err_cv[,"OOB"]))[1]
+  
+  # Run final RF on test set
+  CV_rf_test <- randomForest(Groups_2~., data=dataset_test_2_SMOTE, 
+                             ntree=stable_tree_no_cv, mtry=mintest_OOB_cv) 
+  # Plot ROC curve with AUC
+  pred_probs_rf <- predict(CV_rf_test,dataset_valid_2, type="prob")
+  RF_Lite_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+f]] <- roc(response=dataset_valid_2$Groups_2,
+                              predictor=pred_probs_rf[,2])
+  
+  # Get confusion matrix of best mtry at best threshold
+  best_rf_thres <- coords(RF_Lite_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+f]],x="best",
+                          ret="threshold",
+                          best.method = "closest.topleft")
+  RF_Lite_Group2_ALLQs_pred_CV <- factor(ifelse(pred_probs_rf[,2]>best_rf_thres[1], 
+                                        "HR_ASD", "HR_Neg"))
+  RF_Lite_confmatrix_CV[[fold_num*(i-1)+f]] <- confusionMatrix(data=RF_Lite_Group2_ALLQs_pred_CV,
+                                        reference=dataset_valid_2$Groups_2,
+                                        positive="HR_ASD")
+  
+  RF_Lite_accuracy_CV[[fold_num*(i-1)+f]] <- 
+  RF_Lite_confmatrix_CV[[fold_num*(i-1)+f]]$overall["Accuracy"]
+  
+  RF_Lite_summary_results_CV[[fold_num*(i-1)+f]] <- RF_Lite_confmatrix_CV[[fold_num*(i-1)+f]]$byClass
+  
+  RF_Lite_AUC_CV[[fold_num*(i-1)+f]] <- pROC::auc(RF_Lite_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+f]])
+ }
+}
+
+# Extract sensitivites, specificies, PPV, NPV, AUC
+RF_Lite_accuracy[[j]] <- RF_Lite_accuracy_CV
+
+RF_Lite_all_results_table[[j]] <- data.frame(do.call("rbind", 
+                                                RF_Lite_summary_results_CV))
+RF_Lite_AUC_all[[j]] <- unlist(RF_Lite_AUC_CV)
+# Summarize results in table
+sensitivity_lite_ci[[j]] <- c(round(mean(RF_Lite_all_results_table[[j]]$Sensitivity),2),
+                    round(sd(RF_Lite_all_results_table[[j]]$Sensitivity),2))
+                    
+specificity_lite_ci[[j]] <- c(round(mean(RF_Lite_all_results_table[[j]]$Specificity),2),
+                    round(sd(RF_Lite_all_results_table[[j]]$Specificity),2))
+
+ppv_lite_ci[[j]] <- c(round(mean(RF_Lite_all_results_table[[j]]$Pos.Pred.Value),2),
+                    round(sd(RF_Lite_all_results_table[[j]]$Pos.Pred.Value),2))
+
+npv_lite_ci[[j]] <- c(round(mean(RF_Lite_all_results_table[[j]]$Neg.Pred.Value),2),
+                    round(sd(RF_Lite_all_results_table[[j]]$Neg.Pred.Value),2))
+
+MCR_lite_ci[[j]] <- c(round(mean(1-unlist(RF_Lite_accuracy[[j]])),2),
+                    round(sd(1-unlist(RF_Lite_accuracy[[j]])),2))
+
+AUC_lite_ci[[j]] <- c(round(mean(RF_Lite_AUC_all[[j]]),2),
+                    round(sd(RF_Lite_AUC_all[[j]]),2))
+
+RF_Lite_summary_results_table[[j]] <- matrix(c(paste(sensitivity_lite_ci[[j]][1], 
+                                         paste("(",sensitivity_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" "),
+                                   paste(specificity_lite_ci[[j]][1], 
+                                         paste("(",specificity_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" "),
+                                   paste(ppv_lite_ci[[j]][1], 
+                                         paste("(",ppv_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" "),
+                                   paste(npv_lite_ci[[j]][1], 
+                                         paste("(",npv_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" "),
+                                   paste(MCR_lite_ci[[j]][1], 
+                                         paste("(",MCR_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" "),
+                                   paste(AUC_lite_ci[[j]][1], 
+                                         paste("(",AUC_lite_ci[[j]][2],")",
+                                               sep=""), 
+                                         sep=" ")), nrow=1)
+RF_Lite_summary_results_table[[j]] <- data.frame(RF_Lite_summary_results_table[[j]])
+names(RF_Lite_summary_results_table[[j]]) <- c("Sensitivity", "Specificity","PPV","NPV","MCR","AUC")
+
+kable(as.matrix(RF_Lite_summary_results_table[[j]]), format = "html",
+      caption=paste("Estimated performance measures of random forest algorithm in predicting ASD diagnosis using top",thresholds[j],"FYI questions, from the variable importance results with all questions, as predictors.  The estimated mean and standard deviation are provided, which were calculated using", boots, "repeated 5-fold cross validation", sep=" ")) %>%
+  kable_styling() %>%
+  print() 
+}
+```
+
