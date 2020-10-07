@@ -1093,13 +1093,18 @@ Lastly, we take the RF generated from the entire HR sample without missing value
 ```{r two_cat_ASD, eval=F}
 ## For ASD vs Neg
 dataset_HR_RF <- dataset_HR %>%
-  select(Groups_2, FYIq_1:FYIq_60)
+  select(Identifiers, Groups_2, FYIq_1:FYIq_60)
+
+dataset_HR_RF <- lapply(dataset_HR_RF, FUN=factor) %>% data.frame()
 
 ftable(dataset_HR_RF$Groups_2) # Large imbalance, need to oversample
 
 # Oversample
 set.seed(012)
-dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~., 
+fyi_variables <- names(dataset_HR_RF)[grepl("FYIq_", names(dataset_HR_RF))]
+rf_fyi_formula <- 
+  formula(paste0("Groups_2 ~ ", paste0(fyi_variables, collapse = " + ")))
+dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(rf_fyi_formula, 
                                     data=data.frame(dataset_HR_RF), 
                                     perc.over = 200,
                                     k=5, 
@@ -1114,7 +1119,7 @@ names(dimnames(x)) <- "Diagnois frequencies: Full dataset after SMOTE"
 x
 
 # Run RF
-RF_ASD_test <- randomForest(Groups_2~., 
+RF_ASD_test <- randomForest(rf_fyi_formula, 
                                    data=dataset_HR_RF_SMOTE, ntree=5000)
 plot(RF_ASD_test)
 legend(4000, 0.3, legend=c("HR_Neg", "HR_ASD","Total"), col=c("red","green",
@@ -1136,7 +1141,7 @@ oob.err_2=matrix(NA,max_num_pred,3); colnames(oob.err_2) <- c("OOB","HR_Neg", "H
 
 for(mtry in 1:max_num_pred) 
 {
-  rf=randomForest(Groups_2~., data=dataset_HR_RF_SMOTE,mtry=mtry,
+  rf=randomForest(rf_fyi_formula, data=dataset_HR_RF_SMOTE,mtry=mtry,
                   ntree=stable_tree_no_wholedata) 
   oob.err_2[mtry,] = rf$err.rate[stable_tree_no_wholedata,] #Error of all Trees fitted
   
@@ -1149,7 +1154,7 @@ print("Error rates in OOB set")
 oob.err_2[mintest_OOB_wholedata,] # same Neg error, take smallest
 
 ## Generate final RF algorthim
-rf_ASD_final <- randomForest(Groups_2~., 
+rf_ASD_final <- randomForest(rf_fyi_formula, 
                                    data=dataset_HR_RF_SMOTE,
                              ntree=stable_tree_no_wholedata,
                              mtry=mintest_OOB_wholedata)

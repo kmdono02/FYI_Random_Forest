@@ -1096,12 +1096,18 @@ Lastly, we take the RF generated from the entire HR sample without missing value
 dataset_HR_RF <- dataset_HR %>%
   select(Groups_2, FYIq_1:FYIq_60)
 
+dataset_HR_RF <- lapply(dataset_HR_RF, FUN=factor) %>% data.frame()
+
 ftable(dataset_HR_RF$Groups_2) # Large imbalance, need to oversample
 
 # Oversample
 RNGkind(sample.kind = "Rounding")
 set.seed(012)
-dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(Groups_2~., 
+fyi_variables <- names(dataset_HR_RF)[grepl("FYIq_", names(dataset_HR_RF))]
+rf_fyi_formula <- 
+  formula(paste0("Groups_2 ~ ", paste0(fyi_variables, collapse = " + ")))
+
+dataset_HR_RF_SMOTE <- as_tibble(DMwR::SMOTE(rf_fyi_formula, 
                                     data=data.frame(dataset_HR_RF), 
                                     perc.over = 200,
                                     k=5, 
@@ -1116,7 +1122,7 @@ names(dimnames(x)) <- "Diagnois frequencies: Full dataset after SMOTE"
 x
 
 # Run RF
-RF_ASD_test <- randomForest(Groups_2~., 
+RF_ASD_test <- randomForest(rf_fyi_formula, 
                                    data=dataset_HR_RF_SMOTE, ntree=5000)
 plot(RF_ASD_test)
 legend(4000, 0.3, legend=c("HR_Neg", "HR_ASD","Total"), col=c("red","green",
@@ -1138,7 +1144,7 @@ oob.err_2=matrix(NA,max_num_pred,3); colnames(oob.err_2) <- c("OOB","HR_Neg", "H
 
 for(mtry in 1:max_num_pred) 
 {
-  rf=randomForest(Groups_2~., data=dataset_HR_RF_SMOTE,mtry=mtry,
+  rf=randomForest(rf_fyi_formula, data=dataset_HR_RF_SMOTE,mtry=mtry,
                   ntree=stable_tree_no_wholedata) 
   oob.err_2[mtry,] = rf$err.rate[stable_tree_no_wholedata,] #Error of all Trees fitted
   
@@ -1151,7 +1157,7 @@ print("Error rates in OOB set")
 oob.err_2[mintest_OOB_wholedata,] # same Neg error, take smallest
 
 ## Generate final RF algorthim
-rf_ASD_final <- randomForest(Groups_2~., 
+rf_ASD_final <- randomForest(rf_fyi_formula, 
                                    data=dataset_HR_RF_SMOTE,
                              ntree=stable_tree_no_wholedata,
                              mtry=mintest_OOB_wholedata)
@@ -1164,8 +1170,8 @@ var_importance <- as.matrix(rf_ASD_final$importance[order(rf_ASD_final$importanc
 variables_importance_rank <- rownames(var_importance)
 
 # Save algorithm as a function to allow prediction using any (correctly formatted) dataset
-rf_ASD_predict <- function(dataset, thres="best"){
-  rf_predict_probs <- predict(rf_ASD_final, data=dataset, type = "prob")
+rf_ASD_predict <- function(dataset=dataset_HR_RF_SMOTE, thres="best"){
+  rf_predict_probs <- predict(rf_ASD_final, newdata=dataset, type = "prob")
   dataset_string <- paste("dataset", "$", "Groups_2", sep="")
   rf_predict_roc <- roc(response=eval(parse(text=dataset_string)),
                               predictor=rf_predict_probs[,2])
@@ -1173,10 +1179,14 @@ rf_ASD_predict <- function(dataset, thres="best"){
     best_rf_thres <- coords(rf_predict_roc,
                           x="best", ret="threshold",
                           best.method = "closest.topleft")
-    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>best_rf_thres[1],
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>
+                                          rep(best_rf_thres,
+                                              length(rf_predict_probs[,2])),
                                         "HR_ASD", "HR_Neg"))
   }else{
-    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>thres,
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>
+                                          rep(thres,
+                                              length(rf_predict_probs[,2])),
                                         "HR_ASD", "HR_Neg"))
   }
   output <- list("rf_predicted_probabilities" = rf_predict_probs, "rf_predicted_classes" = rf_predict_classes,
@@ -1190,6 +1200,15 @@ rf_ASD_predict <- function(dataset, thres="best"){
 
 # Save algorthim itself as object
 save(rf_ASD_final, file = "rf_ASD_final.RData")
+
+# Save SMOTE dataset for reproducibility
+save(dataset_HR_RF_SMOTE, file="dataset_HR_RF_SMOTE.RData")
+
+# Get predictions on smote dataset to make sure function works
+smote_rf_train_obj <- rf_ASD_predict(dataset=dataset_HR_RF_SMOTE, thres=0.5)
+
+# Get predictions on dataset w/o SMOTE for Jessica
+data_jessica <- rf_ASD_predict(dataset=dataset_HR_RF_SMOTE, thres=0.5)
 ```
 
 ```{r two_cat_RF_table, eval=F}
@@ -1277,7 +1296,9 @@ for(i in 1:boots){
   best_rf_thres <- coords(RF_Group_2_ALLQs_ROC_CV[[fold_num*(i-1)+j]],
                           x="best", ret="threshold",
                           best.method = "closest.topleft")
-  RF_Group2_ALLQs_pred <- factor(ifelse(pred_probs_rf[,2]>best_rf_thres[1],
+  RF_Group2_ALLQs_pred <- factor(ifelse(pred_probs_rf[,2]>
+                                          rep(best_rf_thres[1],
+                                              length(pred_probs_rf[,2])),
                                         "HR_ASD", "HR_Neg"))
   RF_confmatrix_CV[[fold_num*(i-1)+j]] <- confusionMatrix(data=RF_Group2_ALLQs_pred,
                                         reference=dataset_valid_2$Groups_2,

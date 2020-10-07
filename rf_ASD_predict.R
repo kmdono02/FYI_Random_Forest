@@ -14,10 +14,14 @@ rf_ASD_predict <- function(dataset, thres="best"){
     best_rf_thres <- coords(rf_predict_roc,
                             x="best", ret="threshold",
                             best.method = "closest.topleft")
-    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>best_rf_thres[1],
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>
+                                          rep(best_rf_thres[1],
+                                              length(rf_predict_probs[,2])),
                                         "HR_ASD", "HR_Neg"))
   }else{
-    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>thres,
+    rf_predict_classes <- factor(ifelse(rf_predict_probs[,2]>
+                                          rep(thres,
+                                              length(rf_predict_probs[,2])),
                                         "HR_ASD", "HR_Neg"))
   }
   output <- list("rf_predicted_probabilities" = rf_predict_probs, "rf_predicted_classes" = rf_predict_classes,
@@ -28,3 +32,5 @@ rf_ASD_predict <- function(dataset, thres="best"){
                  "rf_roc_plot" = plot(rf_predict_roc))
   return(output)
 }
+
+rf_predict_obj <- rf_ASD_predict(dataset=dataset_HR_RF_SMOTE)
