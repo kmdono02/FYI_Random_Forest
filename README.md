@@ -4,7 +4,7 @@ Random Forest algorithm using the First Year Inventory (FYI) responses for predi
 # Contents
 1. Analysis Script
 
-The script to replicate all analyses done in Meera et al. (2020) is provided as R Markdown file **FYI_Analysis_Script_V4.Rmd**, including the creation of all demographic and summary statistics, all ANOVA analyses (including some not included in the manuscript or supplemental material), high risk (HR) sample Random Forest analysis with repeated k-fold cross validation, testing HR derived Random Forest on low risk ASD negative (LR-Neg) sample, and FYI Lite analysis.  For those using R 3.6 or above, due to the change in the default random number generator, R Markdown file **FYI_Analysis_Script_V4_forR_updated.Rmd** is also included so that the results in the publication can be replicated for all versions of R.
+The script to replicate all analyses done in Meera et al. (2021) is provided as R Markdown file **FYI_Analysis_Script_V4.Rmd**, including the creation of all demographic and summary statistics, all ANOVA analyses (including some not included in the manuscript or supplemental material), high risk (HR) sample Random Forest analysis with repeated k-fold cross validation, testing HR derived Random Forest on low risk ASD negative (LR-Neg) sample, and FYI Lite analysis.  For those using R 3.6 or above, due to the change in the default random number generator, R Markdown file **FYI_Analysis_Script_V4_forR_updated.Rmd** is also included so that the results in the publication can be replicated for all versions of R.
 
 2. Random Forest algorithm
 
