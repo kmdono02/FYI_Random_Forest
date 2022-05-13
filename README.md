@@ -1,5 +1,5 @@
 # FYI Random Forest Algorithm
-Random Forest algorithm using the First Year Inventory (FYI) responses for predicting Autism Spectrum Disorder (ASD) diagnosis in high risk infants referenced in "Towards A Data Driven Approach To Screen For Autism Risk At 12 Months Of Age" by Meera et al. (2020)
+Random Forest algorithm using the First Year Inventory (FYI) responses for predicting Autism Spectrum Disorder (ASD) diagnosis in high risk infants referenced in "Towards A Data Driven Approach To Screen For Autism Risk At 12 Months Of Age" by Meera et al. (2021)
 
 # Contents
 1. Analysis Script
